@@ -640,6 +640,27 @@ def test_send_markdown_message_uses_rich_message_for_structured_markdown() -> No
     }
 
 
+def test_send_markdown_message_preserves_reply_to_on_plain_button_path() -> None:
+    bot = TelegramBot(TelegramConfig(bot_token="123456:test-token"))
+    context = MessageContext(user_id="42", channel_id="-100123", platform="telegram")
+    keyboard = InlineKeyboard(buttons=[[InlineButton(text="Inspect", callback_data="quick_reply:Inspect")]])
+
+    with patch(
+        "modules.im.telegram.telegram_api.call_api",
+        new=AsyncMock(return_value={"result": {"message_id": 88}}),
+    ) as call_mock:
+        result = asyncio.run(bot.send_markdown_message(context, "Hello **world**", keyboard=keyboard, reply_to="77"))
+
+    assert result == "88"
+    assert call_mock.await_args.args[1] == "sendMessage"
+    payload = call_mock.await_args.args[2]
+    assert payload["reply_parameters"] == {"message_id": 77}
+    assert payload["reply_markup"] == {
+        "inline_keyboard": [[{"text": "Inspect", "callback_data": "quick_reply:Inspect"}]]
+    }
+    assert payload["parse_mode"] == "HTML"
+
+
 def test_send_markdown_message_falls_back_when_rich_message_is_rejected() -> None:
     bot = TelegramBot(TelegramConfig(bot_token="123456:test-token"))
     context = MessageContext(user_id="42", channel_id="-100123", platform="telegram")
@@ -661,6 +682,32 @@ def test_send_markdown_message_falls_back_when_rich_message_is_rejected() -> Non
     fallback_payload = call_mock.await_args_list[1].args[2]
     assert fallback_payload["parse_mode"] == "HTML"
     assert fallback_payload["text"] == "# Summary\n\n- shipped"
+
+
+def test_send_markdown_message_preserves_reply_to_on_rejected_rich_button_fallback() -> None:
+    bot = TelegramBot(TelegramConfig(bot_token="123456:test-token"))
+    context = MessageContext(user_id="42", channel_id="-100123", platform="telegram")
+    keyboard = InlineKeyboard(buttons=[[InlineButton(text="Inspect", callback_data="quick_reply:Inspect")]])
+    markdown = "# Summary\n\n- shipped"
+
+    with patch(
+        "modules.im.telegram.telegram_api.call_api",
+        new=AsyncMock(
+            side_effect=[
+                RuntimeError("Bad Request: rich message is invalid"),
+                {"result": {"message_id": 89}},
+            ]
+        ),
+    ) as call_mock:
+        result = asyncio.run(bot.send_markdown_message(context, markdown, keyboard=keyboard, reply_to="77"))
+
+    assert result == "89"
+    assert [call.args[1] for call in call_mock.await_args_list] == ["sendRichMessage", "sendMessage"]
+    fallback_payload = call_mock.await_args_list[1].args[2]
+    assert fallback_payload["reply_parameters"] == {"message_id": 77}
+    assert fallback_payload["reply_markup"] == {
+        "inline_keyboard": [[{"text": "Inspect", "callback_data": "quick_reply:Inspect"}]]
+    }
 
 
 def test_send_markdown_message_disables_rich_path_after_method_missing() -> None:

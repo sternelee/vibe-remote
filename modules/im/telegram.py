@@ -879,6 +879,25 @@ class TelegramBot(BaseIMClient):
         description = str(err).lower()
         return "method not found" in description
 
+    async def _send_message_with_buttons_payload(
+        self,
+        context: MessageContext,
+        text: str,
+        keyboard: InlineKeyboard,
+        *,
+        parse_mode: Optional[str] = None,
+        reply_to: Optional[str] = None,
+    ) -> str:
+        payload = self._build_payload(
+            context,
+            self.format_markdown(text),
+            keyboard=keyboard,
+            reply_to=reply_to,
+            parse_mode=parse_mode,
+        )
+        result = await telegram_api.call_api(self.config.bot_token, "sendMessage", payload, proxy_url=self._proxy_url)
+        return str(result["result"]["message_id"])
+
     async def send_markdown_message(
         self,
         context: MessageContext,
@@ -894,7 +913,13 @@ class TelegramBot(BaseIMClient):
         """
         if not self._should_send_rich_markdown(text):
             if keyboard is not None:
-                return await self.send_message_with_buttons(context, text, keyboard, parse_mode="markdown")
+                return await self._send_message_with_buttons_payload(
+                    context,
+                    text,
+                    keyboard,
+                    parse_mode="markdown",
+                    reply_to=reply_to,
+                )
             return await self.send_message(context, text, parse_mode="markdown", reply_to=reply_to)
 
         payload = self._build_rich_message_payload(context, text, keyboard=keyboard, reply_to=reply_to)
@@ -910,7 +935,13 @@ class TelegramBot(BaseIMClient):
                 self._rich_markdown_supported = False
             logger.warning("Telegram sendRichMessage failed; falling back to sendMessage", exc_info=True)
             if keyboard is not None:
-                return await self.send_message_with_buttons(context, text, keyboard, parse_mode="markdown")
+                return await self._send_message_with_buttons_payload(
+                    context,
+                    text,
+                    keyboard,
+                    parse_mode="markdown",
+                    reply_to=reply_to,
+                )
             return await self.send_message(context, text, parse_mode="markdown", reply_to=reply_to)
         self._rich_markdown_supported = True
         return str(result["result"]["message_id"])
