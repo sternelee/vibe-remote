@@ -857,3 +857,96 @@ def exchange_oauth_code(config: V2Config, code: str, code_verifier: str) -> dict
     if not claims.get("email_verified"):
         raise ValueError("email_not_verified")
     return {"claims": claims, "token": token_payload}
+
+
+# --- OAuth handshake store -------------------------------------------------
+#
+# The login handshake (PKCE ``code_verifier`` + ``nonce``) is normally carried in
+# a short-lived cookie. iOS standalone PWAs run the cross-origin authorize step in
+# a separate in-app-browser context, so the cookie the callback reads belongs to a
+# *different* ``GET /`` generation than the consent the user approved, and
+# ``cookie.state == url.state`` never holds. We therefore also persist the
+# handshake server-side, keyed by the signed state's random id, so the callback
+# can recover it by the (signature-verified) state in the callback URL. The id is
+# unguessable and single-use; the verifier never leaves the machine.
+
+OAUTH_HANDSHAKE_TTL_SECONDS = 300
+_OAUTH_HANDSHAKE_RID_RE = re.compile(r"\A[A-Za-z0-9_-]{1,64}\Z")
+
+
+def _oauth_handshake_dir() -> Path:
+    return paths.get_runtime_dir() / "oauth_handshakes"
+
+
+def _prune_oauth_handshakes(directory: Path) -> None:
+    cutoff = time.time() - OAUTH_HANDSHAKE_TTL_SECONDS
+    try:
+        entries = list(directory.glob("*.json"))
+    except OSError:
+        return
+    for entry in entries:
+        try:
+            if entry.stat().st_mtime < cutoff:
+                entry.unlink()
+        except OSError:
+            pass
+
+
+def store_oauth_handshake(rid: str, *, nonce: str, code_verifier: str, next_target: str) -> None:
+    """Persist a login handshake keyed by the signed state's random id ``rid``.
+
+    Single-use, ``OAUTH_HANDSHAKE_TTL_SECONDS`` TTL. Written atomically with
+    owner-only permissions under the runtime dir. Invalid ids are ignored.
+    """
+    if not _OAUTH_HANDSHAKE_RID_RE.match(rid or ""):
+        return
+    directory = _oauth_handshake_dir()
+    try:
+        directory.mkdir(parents=True, exist_ok=True)
+        directory.chmod(0o700)
+    except OSError:
+        pass
+    _prune_oauth_handshakes(directory)
+    payload = {
+        "nonce": nonce,
+        "code_verifier": code_verifier,
+        "next": next_target,
+        "exp": int(time.time()) + OAUTH_HANDSHAKE_TTL_SECONDS,
+    }
+    final = directory / f"{rid}.json"
+    tmp = directory / f".{rid}.{os.getpid()}.tmp"
+    try:
+        tmp.write_text(json.dumps(payload, separators=(",", ":")), encoding="utf-8")
+        try:
+            tmp.chmod(0o600)
+        except OSError:
+            pass
+        os.replace(tmp, final)
+    except OSError:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+
+
+def pop_oauth_handshake(rid: str | None) -> dict[str, Any] | None:
+    """Return and delete (single-use) the handshake for ``rid``; None if absent/expired."""
+    if not rid or not _OAUTH_HANDSHAKE_RID_RE.match(rid):
+        return None
+    path = _oauth_handshake_dir() / f"{rid}.json"
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except OSError:
+        return None
+    finally:
+        try:
+            path.unlink()
+        except OSError:
+            pass
+    try:
+        payload = json.loads(raw)
+    except (ValueError, TypeError):
+        return None
+    if not isinstance(payload, dict) or int(payload.get("exp", 0)) <= int(time.time()):
+        return None
+    return payload

@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import ipaddress
+import json
 import socket
 import asyncio
 from collections import namedtuple
 
 import httpx
 
+from config import paths
 from config.v2_config import AgentsConfig, PlatformsConfig, RemoteAccessConfig, RuntimeConfig, SlackConfig, UiConfig, V2Config
 from config.v2_config import CONFIG_LOCK
 from tests.ui_server_test_helpers import csrf_headers
@@ -114,6 +116,22 @@ def test_remote_host_redirects_to_vibe_cloud_login(monkeypatch, tmp_path):
     assert state_payload is not None
     assert state_payload["next"] == "/dashboard"
     assert state_payload["retry"] is False
+
+
+def test_login_redirect_sets_persistent_handshake_cookie(monkeypatch, tmp_path):
+    # iOS standalone PWAs drop session-scoped cookies (no Max-Age) across the
+    # cross-origin authorize excursion, so the callback can't read the handshake
+    # back and deterministically fails with invalid_oauth_state. The handshake
+    # cookie must be persistent. Regression guard for the PWA login dead-end.
+    monkeypatch.setenv("VIBE_REMOTE_HOME", str(tmp_path))
+    config = _save_config(tmp_path)
+
+    with app.test_request_context("/dashboard", base_url="https://alex.avibe.bot"):
+        response = ui_server._redirect_to_vibe_cloud_login(config)
+
+    set_cookie = response.headers["Set-Cookie"]
+    assert set_cookie.startswith(f"{ui_server.REMOTE_OAUTH_COOKIE_NAME}=")
+    assert f"Max-Age={ui_server.REMOTE_OAUTH_HANDSHAKE_TTL_SECONDS}" in set_cookie
 
 
 def test_remote_setup_route_requires_vibe_cloud_login(monkeypatch, tmp_path):
@@ -994,7 +1012,11 @@ def test_remote_callback_rejects_nonce_mismatch(monkeypatch, tmp_path):
     response = client.get(f"/auth/callback?code=test-code&state={state}", base_url="https://alex.avibe.bot")
 
     assert response.status_code == 400
-    assert response.get_json()["error"] == "invalid_oauth_nonce"
+    assert "text/html" in response.headers["Content-Type"]
+    assert "invalid_oauth_nonce" in response.text
+    assert "Sign in again" in response.text
+    # Re-login button points back at the original destination from the handshake.
+    assert 'href="/dashboard"' in response.text
 
 
 def test_remote_callback_rejects_when_remote_access_is_disabled(monkeypatch, tmp_path):
@@ -1064,19 +1086,107 @@ def test_remote_callback_does_not_restart_oauth_twice(monkeypatch, tmp_path):
 
     response = client.get(f"/auth/callback?code=test-code&state={state}", base_url="https://alex.avibe.bot")
 
+    # Auto-retry already spent: render the friendly re-login page, not raw JSON.
     assert response.status_code == 400
-    assert response.get_json()["error"] == "invalid_oauth_state"
+    assert "text/html" in response.headers["Content-Type"]
+    assert "invalid_oauth_state" in response.text
+    assert "Sign in again" in response.text
+    # Retry recovers the original destination from the signed state param.
+    assert 'href="/show/ses123/"' in response.text
 
 
-def test_remote_callback_preserves_invalid_state_response_for_legacy_state(monkeypatch, tmp_path):
+def test_remote_callback_renders_relogin_page_for_legacy_state(monkeypatch, tmp_path):
     monkeypatch.setenv("VIBE_REMOTE_HOME", str(tmp_path))
     _save_config(tmp_path)
     client = app.test_client()
 
     response = client.get("/auth/callback?code=test-code&state=state-1", base_url="https://alex.avibe.bot")
 
+    # Undecodable state has no recoverable destination, so the retry button
+    # falls back to the home page.
     assert response.status_code == 400
-    assert response.get_json()["error"] == "invalid_oauth_state"
+    assert "text/html" in response.headers["Content-Type"]
+    assert "invalid_oauth_state" in response.text
+    assert "Sign in again" in response.text
+    assert 'href="/"' in response.text
+
+
+def test_remote_callback_recovers_via_store_when_cookie_state_desyncs(monkeypatch, tmp_path):
+    # iOS standalone PWA: the handshake cookie carries a *different* (but valid)
+    # state than the one the user approved, because the cross-origin authorize step
+    # runs in a separate in-app-browser context. The callback must still complete by
+    # recovering the PKCE secrets from the server-side store, keyed by the signed URL
+    # state. Regression guard for the deterministic PWA invalid_oauth_state dead-end.
+    monkeypatch.setenv("VIBE_REMOTE_HOME", str(tmp_path))
+    config = _save_config(tmp_path)
+    secret = config.remote_access.vibe_cloud.session_secret
+    client = app.test_client()
+
+    # The flow the user actually approved: a signed state plus its server-side record.
+    rid = "approvedrid000"
+    state_url = ui_server._make_oauth_state(secret, next_target="/dashboard", rid=rid)
+    remote_access.store_oauth_handshake(
+        rid, nonce="nonce-approved", code_verifier="verifier-approved", next_target="/dashboard"
+    )
+
+    # A stale-but-valid cookie from a *different* GET / generation (different state).
+    stale_cookie = ui_server._make_oauth_cookie(
+        secret,
+        {
+            "state": ui_server._make_oauth_state(secret, next_target="/", rid="stalerid0000"),
+            "nonce": "nonce-stale",
+            "code_verifier": "verifier-stale",
+            "next": "/",
+            "exp": int(ui_server.datetime.now().timestamp()) + 300,
+        },
+    )
+    client.set_cookie(ui_server.REMOTE_OAUTH_COOKIE_NAME, stale_cookie, domain="alex.avibe.bot")
+
+    captured = {}
+
+    def exchange(cfg, code, verifier):
+        captured["verifier"] = verifier
+        return {"claims": {"email": "alex@example.com", "sub": "user-1", "nonce": "nonce-approved"}}
+
+    monkeypatch.setattr(remote_access, "exchange_oauth_code", exchange)
+
+    response = client.get(
+        f"/auth/callback?code=test-code&state={state_url}",
+        base_url="https://alex.avibe.bot",
+        follow_redirects=False,
+    )
+
+    assert response.status_code == 302
+    assert response.headers["Location"] == "/dashboard"
+    # Used the server-side record's verifier, not the stale cookie's.
+    assert captured["verifier"] == "verifier-approved"
+    # Handshake is single-use: consumed by the callback.
+    assert remote_access.pop_oauth_handshake(rid) is None
+
+
+def test_oauth_handshake_store_is_single_use_and_expires(monkeypatch, tmp_path):
+    monkeypatch.setenv("VIBE_REMOTE_HOME", str(tmp_path))
+    _save_config(tmp_path)
+
+    remote_access.store_oauth_handshake("rid-abc", nonce="n", code_verifier="v", next_target="/x")
+    first = remote_access.pop_oauth_handshake("rid-abc")
+    assert first is not None
+    assert first["code_verifier"] == "v"
+    assert first["next"] == "/x"
+    # Single-use: a second pop finds nothing.
+    assert remote_access.pop_oauth_handshake("rid-abc") is None
+
+    # An expired record is treated as absent (and removed).
+    remote_access.store_oauth_handshake("rid-exp", nonce="n", code_verifier="v", next_target="/x")
+    record_path = paths.get_runtime_dir() / "oauth_handshakes" / "rid-exp.json"
+    data = json.loads(record_path.read_text())
+    data["exp"] = 0
+    record_path.write_text(json.dumps(data))
+    assert remote_access.pop_oauth_handshake("rid-exp") is None
+
+    # Invalid ids are rejected, never touching the filesystem.
+    assert remote_access.pop_oauth_handshake("bad/rid") is None
+    assert remote_access.pop_oauth_handshake(None) is None
 
 
 def test_remote_callback_accepts_html_escaped_state_separator(monkeypatch, tmp_path):

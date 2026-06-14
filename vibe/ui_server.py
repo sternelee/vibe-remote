@@ -3,6 +3,7 @@ import asyncio
 import gzip
 import hashlib
 import hmac
+import html
 import ipaddress
 import json
 import logging
@@ -113,6 +114,12 @@ CSRF_COOKIE_NAME = "vibe_csrf_token"
 CSRF_HEADER_NAME = "X-Vibe-CSRF-Token"
 REMOTE_OAUTH_COOKIE_NAME = "__Host-vibe_remote_oauth"
 REMOTE_OAUTH_RETRY_PARAM = "__vibe_oauth_retry"
+# Lifetime of the short-lived OAuth handshake (signed state + PKCE cookie). The
+# cookie MUST carry an explicit Max-Age: iOS standalone PWAs drop session-scoped
+# cookies (no Max-Age) across the cross-origin authorize excursion / app
+# backgrounding, which silently breaks the callback. A persistent cookie with a
+# short TTL survives. The signed payload's own `exp` enforces the real validity.
+REMOTE_OAUTH_HANDSHAKE_TTL_SECONDS = 300
 MUTATING_METHODS = {"POST", "PUT", "PATCH", "DELETE"}
 LOG_SOURCES = (
     ("service", "vibe_remote.log", lambda: paths.get_logs_dir() / "vibe_remote.log"),
@@ -1100,13 +1107,13 @@ def _b64url_decode(value: str) -> bytes:
     return base64.urlsafe_b64decode(f"{value}{padding}")
 
 
-def _make_oauth_state(secret: str, *, next_target: str, retry: bool = False) -> str:
+def _make_oauth_state(secret: str, *, next_target: str, retry: bool = False, rid: str | None = None) -> str:
     payload = {
         "v": 1,
-        "r": secrets.token_urlsafe(18),
+        "r": rid or secrets.token_urlsafe(18),
         "next": next_target,
         "retry": bool(retry),
-        "exp": int(datetime.now().timestamp()) + 300,
+        "exp": int(datetime.now().timestamp()) + REMOTE_OAUTH_HANDSHAKE_TTL_SECONDS,
     }
     payload_text = _b64url_encode(json.dumps(payload, separators=(",", ":")).encode("utf-8"))
     signature = _b64url_encode(hmac.new(secret.encode("utf-8"), payload_text.encode("ascii"), hashlib.sha256).digest())
@@ -1132,6 +1139,21 @@ def _read_oauth_state(secret: str, value: str | None) -> dict[str, Any] | None:
     if int(payload.get("exp", 0)) <= int(datetime.now().timestamp()):
         return None
     return payload
+
+
+def _peek_oauth_state_rid(token: str | None) -> str | None:
+    """Best-effort extract a vr1 state token's random id, for diagnostics only.
+
+    Does NOT verify the HMAC — purely to compare which state a request carries.
+    The ``r`` field is a single-use random nonce, not a secret.
+    """
+    if not token or not token.startswith("vr1."):
+        return None
+    try:
+        payload = json.loads(_b64url_decode(token.split(".")[1]).decode("utf-8"))
+        return (str(payload.get("r", ""))[:12]) or None
+    except Exception:
+        return None
 
 
 def _safe_remote_redirect_target(value: Any) -> str:
@@ -1176,12 +1198,19 @@ def _redirect_to_vibe_cloud_login(config: V2Config):
     code_challenge = base64.urlsafe_b64encode(digest).rstrip(b"=").decode("ascii")
     raw_next = request.full_path if request.query_string else request.path
     next_target = _strip_oauth_retry_param(raw_next)
+    rid = secrets.token_urlsafe(18)
     state = _make_oauth_state(
         cloud.session_secret,
         next_target=next_target,
         retry=request.args.get(REMOTE_OAUTH_RETRY_PARAM) == "1",
+        rid=rid,
     )
     nonce = secrets.token_urlsafe(24)
+    # Persist the handshake server-side keyed by the state id, so the callback can
+    # recover the PKCE secrets by the signed URL state even when the cookie desyncs
+    # (iOS standalone PWA runs authorize in a separate in-app-browser context). The
+    # cookie below is kept as the strong per-browser binding for normal browsers.
+    remote_access.store_oauth_handshake(rid, nonce=nonce, code_verifier=code_verifier, next_target=next_target)
     oauth_cookie = _make_oauth_cookie(
         cloud.session_secret,
         {
@@ -1189,7 +1218,7 @@ def _redirect_to_vibe_cloud_login(config: V2Config):
             "nonce": nonce,
             "code_verifier": code_verifier,
             "next": next_target,
-            "exp": int(datetime.now().timestamp()) + 300,
+            "exp": int(datetime.now().timestamp()) + REMOTE_OAUTH_HANDSHAKE_TTL_SECONDS,
         },
     )
     response = Response(status=302)
@@ -1201,6 +1230,7 @@ def _redirect_to_vibe_cloud_login(config: V2Config):
         secure=True,
         samesite="Lax",
         path="/",
+        max_age=REMOTE_OAUTH_HANDSHAKE_TTL_SECONDS,
     )
     return response
 
@@ -1212,6 +1242,167 @@ def _restart_vibe_cloud_login_from_state(config: V2Config, state: str | None):
         return None
     next_target = _safe_remote_redirect_target(payload.get("next"))
     response = redirect(_add_oauth_retry_param(next_target))
+    response.delete_cookie(REMOTE_OAUTH_COOKIE_NAME, path="/", secure=True, samesite="Lax")
+    return response
+
+
+# Human-readable copy for the OAuth callback error page, keyed by error code.
+# Each entry is ``(headline, body)``. Codes not listed fall back to a generic
+# "try again" message so an unexpected failure still renders a usable page.
+_OAUTH_ERROR_PAGE_COPY: dict[str, tuple[str, str]] = {
+    "invalid_oauth_state": (
+        "Your sign-in session expired",
+        "The secure login link expired or couldn't be matched to this browser. "
+        "This usually happens when a sign-in link sits unused for a few minutes, "
+        "or is opened in a different tab or window. Start over and you'll be right back in.",
+    ),
+    "oauth_exchange_failed": (
+        "We couldn't finish signing you in",
+        "Avibe Cloud didn't complete the sign-in just now. This is usually "
+        "temporary — please try again.",
+    ),
+    "invalid_oauth_nonce": (
+        "We couldn't verify this sign-in",
+        "This sign-in attempt couldn't be verified, so we stopped to keep your "
+        "account secure. Start over to continue.",
+    ),
+}
+
+
+def _render_oauth_error_html(error: str, *, retry_href: str) -> str:
+    """Render a branded, self-contained re-login page for a failed OAuth callback.
+
+    Replaces the old raw-JSON dead-end: the user sees a plain-language reason and
+    a single "Sign in again" button that navigates to ``retry_href`` (a sanitized
+    same-origin path), which re-enters the login flow via the auth gate.
+    """
+    title, message = _OAUTH_ERROR_PAGE_COPY.get(
+        error,
+        ("Let's sign you in again", "Your sign-in didn't finish. Please try again."),
+    )
+    safe_title = html.escape(title)
+    safe_message = html.escape(message)
+    safe_href = html.escape(retry_href or "/", quote=True)
+    safe_code = html.escape(error)
+    hint = ""
+    if error == "invalid_oauth_state":
+        hint = (
+            '<p class="oauth-error-hint">Still stuck after trying again? Make sure '
+            "your browser allows cookies for this site.</p>"
+        )
+    return f"""<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="robots" content="noindex">
+    <title>{safe_title}</title>
+    <style>
+      :root {{
+        color-scheme: light;
+        font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        background: #f6f7f9;
+        color: #172033;
+      }}
+      body {{ margin: 0; min-height: 100vh; }}
+      .oauth-error-shell {{
+        min-height: 100vh;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        padding: 32px 18px;
+        box-sizing: border-box;
+      }}
+      .oauth-error-panel {{
+        width: min(460px, 100%);
+        border: 1px solid rgba(23, 32, 51, 0.12);
+        border-radius: 18px;
+        background: rgba(255, 255, 255, 0.96);
+        padding: clamp(28px, 6vw, 40px);
+        box-shadow: 0 24px 80px rgba(23, 32, 51, 0.10);
+        box-sizing: border-box;
+        text-align: center;
+      }}
+      .oauth-error-eyebrow {{
+        color: #526078;
+        font-size: 13px;
+        font-weight: 760;
+        letter-spacing: 0.12em;
+        text-transform: uppercase;
+      }}
+      .oauth-error-panel h1 {{
+        margin: 14px 0 0;
+        font-size: clamp(24px, 6vw, 32px);
+        line-height: 1.12;
+        letter-spacing: 0;
+      }}
+      .oauth-error-panel p {{
+        margin: 14px 0 0;
+        line-height: 1.65;
+        color: #526078;
+      }}
+      .oauth-error-hint {{ font-size: 13px; }}
+      .oauth-error-actions {{ margin-top: 26px; }}
+      .oauth-error-button {{
+        display: inline-block;
+        height: 44px;
+        padding: 0 24px;
+        border-radius: 12px;
+        background: #0f172a;
+        color: #fff;
+        font: 700 15px/44px Inter, ui-sans-serif, system-ui;
+        text-decoration: none;
+      }}
+      .oauth-error-button:hover {{ background: #1e293b; }}
+      .oauth-error-code {{
+        margin-top: 22px;
+        font: 12px/1.4 ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+        color: #94a3b8;
+      }}
+    </style>
+  </head>
+  <body>
+    <main class="oauth-error-shell">
+      <section class="oauth-error-panel">
+        <div class="oauth-error-eyebrow">Avibe</div>
+        <h1>{safe_title}</h1>
+        <p>{safe_message}</p>
+        {hint}
+        <div class="oauth-error-actions">
+          <a class="oauth-error-button" href="{safe_href}">Sign in again</a>
+        </div>
+        <div class="oauth-error-code">{safe_code}</div>
+      </section>
+    </main>
+  </body>
+</html>
+"""
+
+
+def _oauth_callback_error_response(error: str, *, next_target: Any, status: int = 400):
+    """Build the HTML re-login response for a failed OAuth callback.
+
+    Clears any stale handshake cookie so "Sign in again" starts a clean flow, and
+    strips the auto-retry marker from ``next_target`` so the retry gets a fresh
+    attempt (plus one silent auto-retry) instead of immediately failing again.
+    """
+    # Diagnostic only: whether the handshake cookie reached us at all is the key
+    # signal for cookie-loss cases (e.g. iOS standalone PWA). No token values are
+    # logged — only presence and a few non-secret request hints.
+    logger.warning(
+        "oauth callback rejected: error=%s handshake_cookie_present=%s ua=%r sec_fetch_site=%s",
+        error,
+        bool(request.cookies.get(REMOTE_OAUTH_COOKIE_NAME)),
+        (request.headers.get("User-Agent") or "")[:140],
+        request.headers.get("Sec-Fetch-Site") or "",
+    )
+    retry_href = _strip_oauth_retry_param(next_target if isinstance(next_target, str) else "/")
+    response = Response(
+        _render_oauth_error_html(error, retry_href=retry_href),
+        status=status,
+        mimetype="text/html; charset=utf-8",
+    )
+    response.headers["Cache-Control"] = "no-store"
     response.delete_cookie(REMOTE_OAUTH_COOKIE_NAME, path="/", secure=True, samesite="Lax")
     return response
 
@@ -2325,21 +2516,53 @@ def remote_access_auth_callback():
     cloud = config.remote_access.vibe_cloud
     if not cloud.enabled:
         return jsonify({"error": "remote_access_disabled"}), 400
-    oauth_state = _read_oauth_cookie(cloud.session_secret, request.cookies.get(REMOTE_OAUTH_COOKIE_NAME))
-    if not oauth_state or oauth_state.get("state") != _oauth_callback_arg("state"):
-        retry_response = _restart_vibe_cloud_login_from_state(config, _oauth_callback_arg("state"))
+    url_state_token = _oauth_callback_arg("state")
+    cookie_state = _read_oauth_cookie(cloud.session_secret, request.cookies.get(REMOTE_OAUTH_COOKIE_NAME))
+    url_state = _read_oauth_state(cloud.session_secret, url_state_token)
+    # Single-use: consume any server-side handshake for this verified state id, even
+    # when we ultimately use the cookie, so the store stays clean.
+    store_record = remote_access.pop_oauth_handshake(url_state.get("r")) if url_state else None
+
+    # Prefer the cookie when it matches the URL state (strong per-browser binding,
+    # the normal-browser path). Fall back to the server-side handshake when the
+    # cookie is missing or carries a different state — the iOS standalone PWA case,
+    # where the authorize step runs in a separate in-app-browser context and the
+    # cookie desyncs from the state the user actually approved.
+    if cookie_state and cookie_state.get("state") == url_state_token:
+        code_verifier = cookie_state["code_verifier"]
+        handshake_nonce = cookie_state.get("nonce")
+        next_target = cookie_state.get("next")
+    elif store_record is not None:
+        logger.info("oauth callback recovered via server-side handshake (cookie-less or desynced context)")
+        code_verifier = store_record["code_verifier"]
+        handshake_nonce = store_record.get("nonce")
+        next_target = store_record.get("next")
+    else:
+        # Neither the cookie nor the server-side store yielded the handshake.
+        logger.warning(
+            "oauth state check failed: cookie_parsed=%s cookie_state_rid=%s url_state_rid=%s url_state_valid=%s",
+            cookie_state is not None,
+            _peek_oauth_state_rid(cookie_state.get("state")) if cookie_state else None,
+            _peek_oauth_state_rid(url_state_token),
+            url_state is not None,
+        )
+        retry_response = _restart_vibe_cloud_login_from_state(config, url_state_token)
         if retry_response is not None:
             return retry_response
-        return jsonify({"error": "invalid_oauth_state"}), 400
+        # Auto-retry exhausted (or the state is undecodable): show the re-login page,
+        # recovering the original destination from the signed state when possible.
+        next_target = url_state.get("next") if url_state else "/"
+        return _oauth_callback_error_response("invalid_oauth_state", next_target=next_target)
     try:
-        result = remote_access.exchange_oauth_code(config, _oauth_callback_arg("code") or "", oauth_state["code_verifier"])
+        result = remote_access.exchange_oauth_code(config, _oauth_callback_arg("code") or "", code_verifier)
         claims = result["claims"]
     except Exception as exc:
-        return jsonify({"error": "oauth_exchange_failed", "detail": str(exc)}), 400
-    if claims.get("nonce") != oauth_state.get("nonce"):
-        return jsonify({"error": "invalid_oauth_nonce"}), 400
+        logger.warning("vibe cloud oauth code exchange failed: %s", exc)
+        return _oauth_callback_error_response("oauth_exchange_failed", next_target=next_target)
+    if claims.get("nonce") != handshake_nonce:
+        return _oauth_callback_error_response("invalid_oauth_nonce", next_target=next_target)
     response = Response(status=302)
-    response.headers["Location"] = _safe_remote_redirect_target(oauth_state.get("next"))
+    response.headers["Location"] = _safe_remote_redirect_target(next_target)
     response.set_cookie(
         remote_access.SESSION_COOKIE_NAME,
         remote_access.make_session_cookie(config, str(claims.get("email", "")), str(claims.get("sub", ""))),
