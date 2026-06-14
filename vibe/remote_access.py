@@ -7,6 +7,7 @@ import hashlib
 import hmac
 import ipaddress
 import json
+import logging
 import ntpath
 import os
 import platform
@@ -31,6 +32,8 @@ from jwt import PyJWKClient
 from config import paths
 from config.v2_config import V2Config
 from vibe import api, runtime
+
+logger = logging.getLogger(__name__)
 
 CLOUDFLARED_BASE_URL = "https://github.com/cloudflare/cloudflared/releases/latest/download"
 SESSION_COOKIE_NAME = "__Host-vibe_remote_session"
@@ -871,6 +874,11 @@ def exchange_oauth_code(config: V2Config, code: str, code_verifier: str) -> dict
 # unguessable and single-use; the verifier never leaves the machine.
 
 OAUTH_HANDSHAKE_TTL_SECONDS = 300
+# Hard cap on live handshake files. The store is written on every unauthenticated
+# redirect, so without a bound a burst of unauthenticated requests could exhaust
+# inodes within the TTL. The cap sheds *new* writes when full (preserving in-flight
+# logins) and is far above any realistic concurrent-login count.
+OAUTH_HANDSHAKE_MAX_ENTRIES = 2048
 _OAUTH_HANDSHAKE_RID_RE = re.compile(r"\A[A-Za-z0-9_-]{1,64}\Z")
 
 
@@ -878,18 +886,23 @@ def _oauth_handshake_dir() -> Path:
     return paths.get_runtime_dir() / "oauth_handshakes"
 
 
-def _prune_oauth_handshakes(directory: Path) -> None:
+def _prune_oauth_handshakes(directory: Path) -> int:
+    """Delete expired records; return the number of surviving (live) entries."""
     cutoff = time.time() - OAUTH_HANDSHAKE_TTL_SECONDS
+    survivors = 0
     try:
         entries = list(directory.glob("*.json"))
     except OSError:
-        return
+        return 0
     for entry in entries:
         try:
             if entry.stat().st_mtime < cutoff:
                 entry.unlink()
+            else:
+                survivors += 1
         except OSError:
             pass
+    return survivors
 
 
 def store_oauth_handshake(
@@ -909,7 +922,11 @@ def store_oauth_handshake(
         directory.chmod(0o700)
     except OSError:
         pass
-    _prune_oauth_handshakes(directory)
+    # Prune expired records first; if the store is still at capacity (i.e. flooded
+    # with fresh entries), shed this write rather than grow unbounded on disk.
+    if _prune_oauth_handshakes(directory) >= OAUTH_HANDSHAKE_MAX_ENTRIES:
+        logger.warning("oauth handshake store at capacity (>= %d); skipping write", OAUTH_HANDSHAKE_MAX_ENTRIES)
+        return
     payload = {
         "nonce": nonce,
         "code_verifier": code_verifier,

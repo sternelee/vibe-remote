@@ -1217,6 +1217,43 @@ def test_oauth_handshake_store_is_single_use_and_expires(monkeypatch, tmp_path):
     assert remote_access.pop_oauth_handshake(None) is None
 
 
+def test_oauth_handshake_store_caps_entries(monkeypatch, tmp_path):
+    # The store is written on every unauthenticated redirect; a hard cap prevents
+    # unbounded inode growth under a burst. At capacity, new writes are shed and
+    # existing in-flight entries are preserved.
+    monkeypatch.setenv("VIBE_REMOTE_HOME", str(tmp_path))
+    _save_config(tmp_path)
+    monkeypatch.setattr(remote_access, "OAUTH_HANDSHAKE_MAX_ENTRIES", 3)
+
+    for i in range(3):
+        remote_access.store_oauth_handshake(f"rid-{i}", nonce="n", code_verifier="v", next_target="/")
+    remote_access.store_oauth_handshake("rid-overflow", nonce="n", code_verifier="v", next_target="/")
+
+    assert remote_access.pop_oauth_handshake("rid-overflow") is None
+    assert remote_access.pop_oauth_handshake("rid-0") is not None
+
+
+def test_oauth_error_page_localizes_from_accept_language(monkeypatch, tmp_path):
+    # The re-login page copy must come from vibe/i18n and honor the browser's
+    # Accept-Language (the only server-readable locale signal pre-auth).
+    monkeypatch.setenv("VIBE_REMOTE_HOME", str(tmp_path))
+    _save_config(tmp_path)
+    client = app.test_client()
+
+    response = client.get(
+        "/auth/callback?code=test-code&state=state-1",
+        base_url="https://alex.avibe.bot",
+        headers={"Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8"},
+    )
+
+    assert response.status_code == 400
+    body = response.text
+    assert '<html lang="zh"' in body
+    assert "登录会话已过期" in body  # invalid_oauth_state_title (zh)
+    assert "重新登录" in body  # sign_in_again (zh)
+    assert "Your sign-in session expired" not in body  # not the English copy
+
+
 def test_remote_callback_refuses_store_fallback_without_device_binding(monkeypatch, tmp_path):
     # Login-CSRF block: a code+state callback URL must not complete in a browser that
     # isn't the one that started the flow. The store record is bound to the attacker's

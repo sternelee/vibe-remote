@@ -98,6 +98,16 @@ while giving the same binding. Its one assumption (iOS keeps the persistent devi
 cookie stable across the excursion) is verified on the regression PWA; if that ever
 fails, the `localStorage`-nonce variant is the fallback.
 
+### Review round 2 (Codex P2s)
+
+- **Bounded store** — the handshake store is written on every unauthenticated
+  redirect, so it now caps live entries (`OAUTH_HANDSHAKE_MAX_ENTRIES`) and sheds
+  *new* writes when full (preserving in-flight logins), preventing inode exhaustion
+  from a burst of unauthenticated requests.
+- **i18n** — the re-login page copy lives in `vibe/i18n` (`remote_access.oauth_error.*`,
+  en + zh) and renders in the browser's `Accept-Language` (the only server-readable
+  locale signal pre-auth; the SPA keeps its language only in localStorage).
+
 ## Testing
 
 - Unit (`tests/test_ui_remote_access_auth.py`):

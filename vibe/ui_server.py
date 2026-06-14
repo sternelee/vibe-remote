@@ -40,6 +40,7 @@ from core.show_pages import (
 )
 from core.show_session_events import show_event_payload_session_mismatch
 from modules.agents.catalog import AGENT_BACKENDS, supports_runtime_refresh
+from vibe.i18n import get_supported_languages, t
 from vibe.runtime import get_ui_dist_path, get_working_dir
 from vibe.sentry_integration import init_sentry
 
@@ -1298,52 +1299,52 @@ def _restart_vibe_cloud_login_from_state(config: V2Config, state: str | None):
     return response
 
 
-# Human-readable copy for the OAuth callback error page, keyed by error code.
-# Each entry is ``(headline, body)``. Codes not listed fall back to a generic
-# "try again" message so an unexpected failure still renders a usable page.
-_OAUTH_ERROR_PAGE_COPY: dict[str, tuple[str, str]] = {
-    "invalid_oauth_state": (
-        "Your sign-in session expired",
-        "The secure login link expired or couldn't be matched to this browser. "
-        "This usually happens when a sign-in link sits unused for a few minutes, "
-        "or is opened in a different tab or window. Start over and you'll be right back in.",
-    ),
-    "oauth_exchange_failed": (
-        "We couldn't finish signing you in",
-        "Avibe Cloud didn't complete the sign-in just now. This is usually "
-        "temporary — please try again.",
-    ),
-    "invalid_oauth_nonce": (
-        "We couldn't verify this sign-in",
-        "This sign-in attempt couldn't be verified, so we stopped to keep your "
-        "account secure. Start over to continue.",
-    ),
-}
+# Error codes with dedicated copy in vibe/i18n (remote_access.oauth_error.*); any
+# other code falls back to the generic "default_*" strings so an unexpected failure
+# still renders a usable page.
+_OAUTH_ERROR_PAGE_CODES = {"invalid_oauth_state", "oauth_exchange_failed", "invalid_oauth_nonce"}
 
 
-def _render_oauth_error_html(error: str, *, retry_href: str) -> str:
+def _request_ui_language() -> str:
+    """Best-effort UI language for a pre-auth page, from the Accept-Language header.
+
+    The Web UI persists its language only in localStorage (not a server-readable
+    cookie), so Accept-Language is the available signal here — and it matches what
+    the SPA's own navigator-based detection would pick. Falls back to English.
+    """
+    supported = set(get_supported_languages())
+    for part in (request.headers.get("Accept-Language") or "").split(","):
+        tag = part.split(";")[0].strip().lower()
+        if not tag:
+            continue
+        if tag in supported:
+            return tag
+        primary = tag.split("-")[0]
+        if primary in supported:
+            return primary
+    return "en"
+
+
+def _render_oauth_error_html(error: str, *, retry_href: str, lang: str = "en") -> str:
     """Render a branded, self-contained re-login page for a failed OAuth callback.
 
-    Replaces the old raw-JSON dead-end: the user sees a plain-language reason and
-    a single "Sign in again" button that navigates to ``retry_href`` (a sanitized
-    same-origin path), which re-enters the login flow via the auth gate.
+    Replaces the old raw-JSON dead-end: the user sees a plain-language reason and a
+    single re-login button that navigates to ``retry_href`` (a sanitized same-origin
+    path), which re-enters the login flow via the auth gate. Copy is served from
+    ``vibe/i18n`` in ``lang``.
     """
-    title, message = _OAUTH_ERROR_PAGE_COPY.get(
-        error,
-        ("Let's sign you in again", "Your sign-in didn't finish. Please try again."),
-    )
-    safe_title = html.escape(title)
-    safe_message = html.escape(message)
+    key = error if error in _OAUTH_ERROR_PAGE_CODES else "default"
+    safe_lang = html.escape(lang, quote=True)
+    safe_title = html.escape(t(f"remote_access.oauth_error.{key}_title", lang))
+    safe_message = html.escape(t(f"remote_access.oauth_error.{key}_body", lang))
+    safe_button = html.escape(t("remote_access.oauth_error.sign_in_again", lang))
     safe_href = html.escape(retry_href or "/", quote=True)
     safe_code = html.escape(error)
     hint = ""
     if error == "invalid_oauth_state":
-        hint = (
-            '<p class="oauth-error-hint">Still stuck after trying again? Make sure '
-            "your browser allows cookies for this site.</p>"
-        )
+        hint = f'<p class="oauth-error-hint">{html.escape(t("remote_access.oauth_error.cookie_hint", lang))}</p>'
     return f"""<!doctype html>
-<html lang="en">
+<html lang="{safe_lang}">
   <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -1421,7 +1422,7 @@ def _render_oauth_error_html(error: str, *, retry_href: str) -> str:
         <p>{safe_message}</p>
         {hint}
         <div class="oauth-error-actions">
-          <a class="oauth-error-button" href="{safe_href}">Sign in again</a>
+          <a class="oauth-error-button" href="{safe_href}">{safe_button}</a>
         </div>
         <div class="oauth-error-code">{safe_code}</div>
       </section>
@@ -1450,7 +1451,7 @@ def _oauth_callback_error_response(error: str, *, next_target: Any, status: int 
     )
     retry_href = _strip_oauth_retry_param(next_target if isinstance(next_target, str) else "/")
     response = Response(
-        _render_oauth_error_html(error, retry_href=retry_href),
+        _render_oauth_error_html(error, retry_href=retry_href, lang=_request_ui_language()),
         status=status,
         mimetype="text/html; charset=utf-8",
     )
