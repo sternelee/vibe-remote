@@ -1560,21 +1560,19 @@ const MessageRow = memo(function MessageRow({ message, session, messageFontSize,
 
   // Agent / system replies AND the user's own messages render as markdown (users
   // routinely type lists / code / **emphasis** and expect it formatted). Only
-  // harness-triggered prompts (scheduled task / watch / webhook) stay verbatim —
-  // that row is a collapsed technical preview where the raw text is the point.
+  // Every message body renders as Markdown — including the expanded harness row
+  // (scheduled task / watch / webhook prompt), which used to stay verbatim.
+  // Harness prompts and the user's own messages keep soft breaks so their
+  // original line breaks stay visible (a harness prompt often mixes authored
+  // Markdown with line-oriented waiter output); agent/system replies are
+  // authored Markdown and must not get stray hard breaks.
   const bodyNode = message.text ? (
-    isHarness ? (
-      <div className="whitespace-pre-wrap break-words text-[13px] text-foreground">{message.text}</div>
-    ) : (
-      // Keep the user's own newlines visible (soft-break → <br>); agent/system
-      // replies are authored markdown and must not get stray hard breaks.
-      <Markdown
-        content={message.text}
-        softBreaks={isUser}
-        references={(message.content as { references?: MentionReference[] } | null)?.references}
-        className="vr-markdown--inherit-size"
-      />
-    )
+    <Markdown
+      content={message.text}
+      softBreaks={isUser || isHarness}
+      references={(message.content as { references?: MentionReference[] } | null)?.references}
+      className="vr-markdown--inherit-size"
+    />
   ) : messageAttachments.length === 0 ? (
     <div className="text-[13px] text-muted">—</div>
   ) : null;
