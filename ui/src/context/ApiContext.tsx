@@ -183,7 +183,12 @@ export type ApiContextType = {
   /** Counts of resources permanently reclaimed when archiving this session
    *  (bound tasks/watches + active runs) — drives the irreversible-confirm dialog. */
   getArchivePreview: (sessionId: string) => Promise<{ tasks: number; watches: number; runs: number; queued: number }>;
-  listSessionMessages: (sessionId: string, params?: { afterId?: string; beforeId?: string; limit?: number; tail?: boolean; cache?: boolean }) => Promise<{ messages: WorkbenchMessage[]; next_after_id: string | null; next_before_id?: string | null }>;
+  listSessionMessages: (sessionId: string, params?: { afterId?: string; beforeId?: string; aroundId?: string; limit?: number; tail?: boolean; cache?: boolean }) => Promise<{ messages: WorkbenchMessage[]; next_after_id: string | null; next_before_id?: string | null }>;
+  // Full-text search over message content across all sessions. Backed by the
+  // non-cached GET /api/search/messages (the query string varies per keystroke,
+  // so caching would only bloat the read cache). Results group matches by
+  // session, sessions ordered most-recent-match first.
+  searchMessages: (q: string, opts?: { limit?: number }) => Promise<MessageSearchResult>;
   sendSessionMessage: (sessionId: string, payload: { text?: string; content?: Record<string, unknown>; metadata?: Record<string, unknown>; author_id?: string; author_name?: string }) => Promise<WorkbenchMessage>;
   markSessionRead: (sessionId: string, untilMessageId?: string) => Promise<{ updated: number; unread_counts: Record<string, number>; unread_by_session: Record<string, number> }>;
   cancelSession: (
@@ -516,6 +521,44 @@ export type WorkbenchMessage = {
   updated_at: string;
   delivered_at: string | null;
   read_at: string | null;
+};
+
+// One highlighted message-content hit from GET /api/search/messages, split by
+// the server so the UI never has to locate the match: ``prefix`` + ``match`` +
+// ``suffix`` reconstruct a window of the message text, with ``match`` the part
+// to highlight (empty when the snippet is just leading context).
+export type MessageSnippet = {
+  prefix: string;
+  match: string;
+  suffix: string;
+};
+
+// A single matching message within a session group. ``type`` is the coarse
+// chat role the row chip renders ('user' → YOU, otherwise AGENT); ``source``
+// carries provenance (harness/user/agent) like WorkbenchMessage.
+export type MessageSearchMatch = {
+  id: string;
+  author: string;
+  source: string | null;
+  type: 'user' | 'result' | string;
+  created_at: string;
+  snippet: MessageSnippet;
+};
+
+// Matches grouped by their session, with enough session/project context to
+// render a group header and (in P3/P4) navigate into the chat at the match.
+export type MessageSearchSession = {
+  session_id: string;
+  title: string | null;
+  project_id: string | null;
+  project_name: string | null;
+  matches: MessageSearchMatch[];
+};
+
+export type MessageSearchResult = {
+  sessions: MessageSearchSession[];
+  total: number;
+  session_count: number;
 };
 
 export type WorkbenchSessionBootstrap = {
@@ -1696,12 +1739,19 @@ export const ApiProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       const search = new URLSearchParams();
       if (params?.afterId) search.set('after_id', params.afterId);
       if (params?.beforeId) search.set('before_id', params.beforeId);
+      if (params?.aroundId) search.set('around_id', params.aroundId);
       if (params?.limit) search.set('limit', String(params.limit));
       if (params?.tail) search.set('tail', '1');
       const qs = search.toString();
       const base = `/api/sessions/${encodeURIComponent(sessionId)}/messages`;
       const path = qs ? `${base}?${qs}` : base;
       return params?.cache === false ? getJson(path) : getCachedJson(path);
+    },
+    searchMessages: (q, opts) => {
+      const search = new URLSearchParams();
+      search.set('q', q);
+      if (opts?.limit) search.set('limit', String(opts.limit));
+      return getJson(`/api/search/messages?${search.toString()}`);
     },
     sendSessionMessage: (sessionId, payload) =>
       postJson(`/api/sessions/${encodeURIComponent(sessionId)}/messages`, payload),

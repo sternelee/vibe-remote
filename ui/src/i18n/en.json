@@ -627,6 +627,10 @@
       "harness": "Harness",
       "vaults": "Vaults"
     },
+    "search": {
+      "roleYou": "You",
+      "roleAgent": "Agent"
+    },
     "inbox": {
       "eyebrow": "Inbox",
       "title": "Inbox",

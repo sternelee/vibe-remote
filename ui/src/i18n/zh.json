@@ -627,6 +627,10 @@
       "harness": "Harness",
       "vaults": "Vaults"
     },
+    "search": {
+      "roleYou": "你",
+      "roleAgent": "助手"
+    },
     "inbox": {
       "eyebrow": "收件箱",
       "title": "收件箱",
