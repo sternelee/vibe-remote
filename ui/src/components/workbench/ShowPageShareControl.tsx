@@ -32,8 +32,10 @@ export const ShowPageShareControl: React.FC<{
   const [loading, setLoading] = useState(false);
   const [busy, setBusy] = useState(false);
   const [copied, setCopied] = useState(false);
-  // Monotonic guard: a slow ensure() must not overwrite a newer visibility
-  // result (or a link rotated elsewhere). Only the latest request applies.
+  // A visibility mutation is authoritative: it always applies its result and
+  // clears its own busy state, and it invalidates any refresh read issued
+  // before it resolved. A refresh (read) only applies if no newer request has
+  // superseded it. reqSeq orders the reads; a mutation bumps it on resolve.
   const reqSeq = useRef(0);
 
   useEffect(() => {
@@ -59,9 +61,7 @@ export const ShowPageShareControl: React.FC<{
         if (seq === reqSeq.current) setPayload(res);
       })
       .catch(() => undefined)
-      .finally(() => {
-        if (seq === reqSeq.current) setLoading(false);
-      });
+      .finally(() => setLoading(false));
   };
 
   const handleOpenChange = (next: boolean) => {
@@ -70,17 +70,17 @@ export const ShowPageShareControl: React.FC<{
   };
 
   const toggleVisibility = (nextPublic: boolean) => {
-    const seq = ++reqSeq.current;
     setBusy(true);
     api
       .setShowPageVisibility(sessionId, nextPublic ? 'public' : 'private')
       .then((res: ShowPagePayload) => {
-        if (seq === reqSeq.current) setPayload(res);
+        // Authoritative server state: always apply it, and invalidate any
+        // in-flight refresh read so a stale read can't revert us afterwards.
+        setPayload(res);
+        reqSeq.current += 1;
       })
       .catch(() => undefined)
-      .finally(() => {
-        if (seq === reqSeq.current) setBusy(false);
-      });
+      .finally(() => setBusy(false));
   };
 
   const copyLink = async () => {
