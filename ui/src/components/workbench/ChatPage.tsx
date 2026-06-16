@@ -166,6 +166,12 @@ export const ChatPage: React.FC = () => {
   const [agents, setAgents] = useState<VibeAgentBrief[]>([]);
   const [defaultAgentName, setDefaultAgentName] = useState<string | null>(null);
   const [messages, setMessages] = useState<WorkbenchMessage[]>([]);
+  // Mirror the latest messages into a ref (updated every render) so effects that
+  // must NOT re-run on every message change — chiefly the deep-link jump effect,
+  // whose around-fetch would otherwise be cancelled by an SSE/reconcile update —
+  // can still read the current transcript without listing ``messages`` as a dep.
+  const messagesRef = useRef(messages);
+  messagesRef.current = messages;
   const [olderCursor, setOlderCursor] = useState<string | null>(null);
   const [loadingOlder, setLoadingOlder] = useState(false);
   const loadingOlderRef = useRef(false);
@@ -175,6 +181,13 @@ export const ChatPage: React.FC = () => {
   // load-newer path is inert and behavior is unchanged. Lets the user scroll
   // DOWN from a jumped-to old message back toward recent messages.
   const [newerCursor, setNewerCursor] = useState<string | null>(null);
+  // Mirror newerCursor into a ref (updated every render) so callbacks whose deps
+  // must stay stable — ``reconcile`` (which the SSE subscription effect depends
+  // on) — can branch on "are we in an around-jump window?" without re-creating
+  // themselves (and re-subscribing) every time the cursor changes. Non-null only
+  // after a search jump that landed away from the live tail.
+  const newerCursorRef = useRef<string | null>(newerCursor);
+  newerCursorRef.current = newerCursor;
   const [loadingNewer, setLoadingNewer] = useState(false);
   const loadingNewerRef = useRef(false);
   const oldestLoadedIdRef = useRef<string | null>(null);
@@ -288,6 +301,14 @@ export const ChatPage: React.FC = () => {
   // queued turn that is still in flight (Codex P2). Cheap + idempotent.
   const reconcile = useCallback(async () => {
     if (!sessionId) return;
+    // Around-jump window active (a search jump landed away from the live tail):
+    // the transcript is a centered window with its OWN older/newer cursors and a
+    // deliberate gap to the live tail. A tail reconcile would splice a disjoint
+    // recent window in (creating a hole) and overwrite ``olderCursor`` with the
+    // tail page's ``next_before_id`` — so scrolling UP from the match would then
+    // skip messages. Skip it entirely until the user pages back down to the tail
+    // (newerCursor clears), at which point normal reconcile resumes (Codex P2).
+    if (newerCursorRef.current) return;
     try {
       // tail: the RECENT window (not the oldest page), so a missed latest row in
       // a long chat is actually recovered (Codex P2).
@@ -374,6 +395,31 @@ export const ChatPage: React.FC = () => {
       }
     }
   }, [api, newerCursor, sessionId]);
+
+  // Jump-to-latest from an around-jump window. In around-mode (newerCursor set)
+  // the transcript is a centered window with a gap to the live tail, so the
+  // normal scrollToBottom would only reveal the bottom of that window and chain
+  // a single loadNewer page — never reaching the real tail. Fetch a fresh TAIL
+  // window, replace the transcript with it, and clear the newer cursor so the
+  // chat is caught up to live again (pinning + auto-follow resume). Resolves so
+  // the Transcript can scroll to the bottom once the tail is in the DOM. When
+  // there is no newer cursor we're already at the tail — the caller just scrolls.
+  const jumpToLatest = useCallback(async () => {
+    if (!sessionId || !newerCursor) return;
+    try {
+      const res = await api.listSessionMessages(sessionId, { limit: 50, tail: true, cache: false });
+      if (sessionId !== sessionIdRef.current) return; // switched chats mid-fetch
+      const tailMessages = res.messages.filter(isTranscriptMessage);
+      if (tailMessages.length === 0) return;
+      setMessages(tailMessages);
+      setOlderCursor(res.next_before_id ?? null);
+      // Caught up to the live tail — drop the newer cursor so the load-newer path
+      // goes inert and the transcript follows new rows again.
+      setNewerCursor(null);
+    } catch {
+      /* keep the around window; the user can retry */
+    }
+  }, [api, sessionId, newerCursor]);
 
   // Persist the composer's unsent text server-side (debounced) so it survives a
   // reload / device switch. The send path clears it server-side; this only
@@ -978,6 +1024,12 @@ export const ChatPage: React.FC = () => {
     handledJumpRef.current = targetMsg;
     const requestSessionId = sessionId;
 
+    // If the user is viewing this same session in Show Page mode, the chat
+    // surface (transcript) is hidden behind the iframe — a scroll + highlight
+    // there would be unseen. Exit Show Page mode so the chat is visible for the
+    // jump (the user came here from a search result, so they want the message).
+    setShowPageMode(false);
+
     // Clear only ``msg`` (preserve any other query params) so a re-render /
     // visibility gap-recovery can't re-fire the jump. Read the live URL so we
     // don't need the reactive ``searchParams`` in this effect's deps.
@@ -987,8 +1039,12 @@ export const ChatPage: React.FC = () => {
       setSearchParams(next, { replace: true });
     };
 
-    // Already loaded → jump directly, no fetch.
-    if (messages.some((m) => m.id === targetMsg)) {
+    // Already loaded → jump directly, no fetch. Read the CURRENT transcript via
+    // the ref so this effect doesn't depend on ``messages`` (an SSE/reconcile
+    // update would otherwise re-run it, and its cleanup would cancel the
+    // in-flight around-fetch — dropping the fetched window so ``msg`` never
+    // scrolls/clears) (Codex P2).
+    if (messagesRef.current.some((m) => m.id === targetMsg)) {
       setJumpTarget(targetMsg);
       startHighlight(targetMsg);
       clearParam();
@@ -1023,9 +1079,12 @@ export const ChatPage: React.FC = () => {
       }
     })();
     return () => {
+      // ``cancelled`` trips only on session-change / unmount / a new ``msg``
+      // target — NOT on a ``messages`` change (it isn't a dep), so an SSE or
+      // reconcile update can't cancel the in-flight around-fetch (Codex P2).
       cancelled = true;
     };
-  }, [deepLinkMessageId, sessionId, loading, session, messages, api, startHighlight, setSearchParams]);
+  }, [deepLinkMessageId, sessionId, loading, session, api, startHighlight, setSearchParams]);
 
   // Clear a pending highlight timer on unmount so it can't fire after teardown.
   useEffect(() => {
@@ -1242,6 +1301,7 @@ export const ChatPage: React.FC = () => {
           hasNewer={!!newerCursor}
           loadingNewer={loadingNewer}
           onLoadNewer={loadNewerMessages}
+          onJumpToLatest={jumpToLatest}
           jumpTarget={jumpTarget}
           onJumpHandled={() => setJumpTarget(null)}
           highlightedId={highlightedId}
@@ -1553,6 +1613,10 @@ interface TranscriptProps {
   hasNewer: boolean;
   loadingNewer: boolean;
   onLoadNewer: () => void;
+  // Jump-to-latest while in an around-jump window: fetches a fresh tail window
+  // and clears the newer cursor (resolves once the tail is loaded), so the jump
+  // button can then scroll to the true bottom. Inert when not in around-mode.
+  onJumpToLatest: () => Promise<void>;
   // Deep-link jump (P5): the message id to scroll to once it's in the DOM, a
   // callback to ack the jump (so it runs once per target), and the id currently
   // highlighted (~3s mint fade on the matching row).
@@ -1573,6 +1637,7 @@ const Transcript: React.FC<TranscriptProps> = ({
   hasNewer,
   loadingNewer,
   onLoadNewer,
+  onJumpToLatest,
   jumpTarget,
   onJumpHandled,
   highlightedId,
@@ -1603,6 +1668,7 @@ const Transcript: React.FC<TranscriptProps> = ({
   const [showJump, setShowJump] = useState(false);
   const loadOlderRef = useRef(onLoadOlder);
   const loadNewerRef = useRef(onLoadNewer);
+  const jumpToLatestRef = useRef(onJumpToLatest);
 
   useEffect(() => {
     loadOlderRef.current = onLoadOlder;
@@ -1611,6 +1677,10 @@ const Transcript: React.FC<TranscriptProps> = ({
   useEffect(() => {
     loadNewerRef.current = onLoadNewer;
   }, [onLoadNewer]);
+
+  useEffect(() => {
+    jumpToLatestRef.current = onJumpToLatest;
+  }, [onJumpToLatest]);
 
   // The reply arrives atomically as a persisted ``result`` row (no streaming
   // card), so the thinking bubble shows for the whole gap between send and
@@ -1657,6 +1727,23 @@ const Transcript: React.FC<TranscriptProps> = ({
     anchorRef.current = null;
     setShowJump(false);
   }, []);
+
+  // Jump-to-latest handler behind the down-arrow button. In an around-jump
+  // window (hasNewer) the transcript is centered on an old match with a gap to
+  // the live tail, so scrolling to the bottom of the LOADED window wouldn't
+  // reach the newest message. Ask ChatPage to swap in a fresh tail window first
+  // (it clears the newer cursor), then scroll to the true bottom on the next
+  // frame — after the tail rows have committed to the DOM — and resume pinning.
+  // Outside around-mode we're already at the tail, so just scroll.
+  const jumpToLatest = useCallback(() => {
+    if (!hasNewer) {
+      scrollToBottom();
+      return;
+    }
+    void jumpToLatestRef.current().then(() => {
+      requestAnimationFrame(() => scrollToBottom());
+    });
+  }, [hasNewer, scrollToBottom]);
 
   const handleScroll = () => {
     const el = scrollRef.current;
@@ -1823,7 +1910,7 @@ const Transcript: React.FC<TranscriptProps> = ({
           type="button"
           variant="secondary"
           size="icon"
-          onClick={() => scrollToBottom()}
+          onClick={jumpToLatest}
           aria-label={t('chat.scrollToBottom')}
           className="absolute bottom-3 left-1/2 size-9 -translate-x-1/2 rounded-full border-border-strong shadow-lg"
         >

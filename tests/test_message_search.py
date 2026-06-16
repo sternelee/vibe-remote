@@ -19,7 +19,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from storage import messages_service
 from storage.db import create_sqlite_engine
 from storage.importer import ensure_sqlite_state
-from storage.models import agent_sessions, messages, scopes
+from storage.models import agent_sessions, messages, scope_settings, scopes
 from storage.settings_service import upsert_scope
 
 
@@ -201,6 +201,43 @@ def test_search_excludes_archived_session(isolated_state):
         _seed_session(conn, scope_id, "ses_arch", "Archived", status="archived")
         _insert_msg(conn, scope_id, "ses_live", "user", "deploy here", "2026-06-01T10:00:00Z")
         _insert_msg(conn, scope_id, "ses_arch", "user", "deploy there", "2026-06-01T10:01:00Z")
+
+    with engine.connect() as conn:
+        result = messages_service.search_messages(conn, query="deploy")
+
+    assert result["session_count"] == 1
+    assert result["sessions"][0]["session_id"] == "ses_live"
+
+
+def test_search_excludes_archived_project_scope(isolated_state):
+    """A message in an ACTIVE session under an archived PROJECT is excluded.
+
+    ``projects_service.archive_project`` archives a project by setting
+    ``scope_settings.enabled = 0`` while leaving its sessions ``active``, so the
+    disabled scope — not a session status — is the "archived project" signal.
+    A scope with no ``scope_settings`` row is still treated as enabled."""
+    engine = create_sqlite_engine()
+    with engine.begin() as conn:
+        # Live project (no scope_settings row → treated as enabled) keeps its match.
+        live_scope = _seed_scope(conn, native_id="proj_live", display_name="Live Project")
+        _seed_session(conn, live_scope, "ses_live", "Live", status="active")
+        _insert_msg(conn, live_scope, "ses_live", "user", "deploy here", "2026-06-01T10:00:00Z")
+        # Archived project: an explicit scope_settings row with enabled=0, but its
+        # session stays active — its messages must NOT surface.
+        arch_scope = _seed_scope(conn, native_id="proj_arch", display_name="Archived Project")
+        _seed_session(conn, arch_scope, "ses_arch_proj", "Under Archived", status="active")
+        _insert_msg(conn, arch_scope, "ses_arch_proj", "user", "deploy there", "2026-06-01T10:01:00Z")
+        now = messages_service._utc_now_iso()
+        conn.execute(
+            scope_settings.insert().values(
+                scope_id=arch_scope,
+                enabled=0,
+                settings_version=1,
+                settings_json="{}",
+                created_at=now,
+                updated_at=now,
+            )
+        )
 
     with engine.connect() as conn:
         result = messages_service.search_messages(conn, query="deploy")

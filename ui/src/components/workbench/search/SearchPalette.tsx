@@ -86,6 +86,12 @@ export const SearchPalette: React.FC<SearchPaletteProps> = ({ open, onClose }) =
   };
 
   const onKeyDown = (e: React.KeyboardEvent) => {
+    // While an IME composition is active (Chinese/Japanese/Korean candidate
+    // selection), ArrowUp/Down/Enter belong to the IME — navigating candidates
+    // and committing the chosen one. Intercepting them would steal those keys
+    // from the input. ``keyCode === 229`` is the legacy IME-in-progress signal
+    // for browsers that don't set ``isComposing`` on the synthetic event.
+    if (e.nativeEvent.isComposing || e.keyCode === 229) return;
     if (e.key === 'ArrowDown') {
       e.preventDefault();
       moveSelection(1);

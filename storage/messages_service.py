@@ -21,7 +21,7 @@ from sqlalchemy import and_, delete, func, or_, select, update
 from sqlalchemy.engine import Connection
 
 from storage.db import escape_sql_like
-from storage.models import agent_sessions, messages, scopes
+from storage.models import agent_sessions, messages, scope_settings, scopes
 
 
 def _utc_now_iso() -> str:
@@ -138,7 +138,12 @@ def search_messages(
     to one ``platform`` (Workbench = ``avibe``) and a set of transcript-visible
     ``types`` (the user's prompts + the agent's rendered ``result`` replies — both
     land on a message the chat actually renders, so a clicked result is always
-    jumpable). Archived sessions are excluded. ``limit`` caps the number of
+    jumpable). Archived sessions are excluded, as are messages under an archived
+    PROJECT — ``projects_service.archive_project`` disables a project by setting
+    ``scope_settings.enabled = 0`` (its sessions stay ``active``), so the scope's
+    disabled state is the authoritative "archived project" signal here. A scope
+    with no ``scope_settings`` row is treated as enabled (legacy / folder-less
+    projects never got one). ``limit`` caps the number of
     MATCHED messages scanned (newest first), so it bounds total work; the matches
     are then grouped into sessions. The snippet is built in Python (see
     :func:`build_snippet`) so the client renders ``match`` with a highlight and
@@ -172,9 +177,9 @@ def search_messages(
             scopes.c.display_name.label("project_name"),
         )
         .select_from(
-            messages.join(agent_sessions, agent_sessions.c.id == messages.c.session_id).join(
-                scopes, scopes.c.id == agent_sessions.c.scope_id, isouter=True
-            )
+            messages.join(agent_sessions, agent_sessions.c.id == messages.c.session_id)
+            .join(scopes, scopes.c.id == agent_sessions.c.scope_id, isouter=True)
+            .join(scope_settings, scope_settings.c.scope_id == agent_sessions.c.scope_id, isouter=True)
         )
         .where(messages.c.platform == platform)
         .where(messages.c.type.in_(type_list))
@@ -182,6 +187,10 @@ def search_messages(
         .where(messages.c.content_text.ilike(f"%{like}%", escape="\\"))
         # Archived sessions are soft-deleted — never surface their messages.
         .where(agent_sessions.c.status != "archived")
+        # Archived PROJECTS are modelled as scope_settings.enabled = 0 (the
+        # sessions stay active), so exclude a disabled scope's messages too. A
+        # missing scope_settings row (legacy / folder-less project) is enabled.
+        .where(or_(scope_settings.c.enabled.is_(None), scope_settings.c.enabled != 0))
         .order_by(messages.c.created_at.desc(), messages.c.id.desc())
         .limit(effective_limit)
     )
