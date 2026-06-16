@@ -486,6 +486,12 @@ class OpenCodeAgent(OpenCodeMessageProcessorMixin, BaseAgent):
             for base_id, req_info in self._session_manager.list_for_session_key(session_key).items()
         }
 
+    def runtime_turn_keys(self) -> set[str]:
+        return {
+            f"{base_id}:{req_info[1]}"
+            for base_id, req_info in self._session_manager.list_all().items()
+        }
+
     async def _delete_ack(self, request: AgentRequest) -> None:
         service = getattr(self.controller, "processing_indicator", None)
         if service is not None:

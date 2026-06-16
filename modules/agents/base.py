@@ -105,6 +105,14 @@ class BaseAgent(ABC):
         backend_key = str(payload.get("backend_composite_session_id") or "").strip()
         return backend_key or request.composite_session_id
 
+    def runtime_turn_keys(self) -> set[str]:
+        """Return all currently known runtime identities for this backend."""
+        return set()
+
+    def runtime_turn_keys_for_session_key(self, session_key: str) -> set[str]:
+        """Return runtime identities scoped to a persisted Avibe settings key."""
+        return set()
+
     def ensure_agent_session_id(
         self,
         request: AgentRequest,

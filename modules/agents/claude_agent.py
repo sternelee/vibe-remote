@@ -223,16 +223,18 @@ class ClaudeAgent(BaseAgent):
         agent_map = self.sessions.list_agent_sessions(session_key, self.name)
         session_bases_to_clear = set(agent_map.keys())
         runtime_keys = set()
-        session_ids = set(self.claude_sessions.keys()) | set(self.receiver_tasks.keys())
-        for composite_id in session_ids:
+        for composite_id in self.runtime_turn_keys():
             base_part = composite_id.split(":", 1)[0] if ":" in composite_id else composite_id
             if base_part in session_bases_to_clear:
                 runtime_keys.add(composite_id)
         return runtime_keys
 
+    def runtime_turn_keys(self) -> set[str]:
+        return set(self.claude_sessions.keys()) | set(self.receiver_tasks.keys())
+
     async def refresh_auth_state(self) -> None:
         """Reconnect Claude runtime so future requests load fresh auth."""
-        session_ids = set(self.claude_sessions.keys()) | set(self.receiver_tasks.keys())
+        session_ids = self.runtime_turn_keys()
 
         for composite_id in session_ids:
             await self._cleanup_runtime_session(composite_id)

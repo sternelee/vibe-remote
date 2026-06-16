@@ -14,6 +14,8 @@ from .base import (
 
 logger = logging.getLogger(__name__)
 
+STALE_STOP_REASONS = {"not_active", "runtime_unavailable"}
+
 
 class AgentService:
     """Registry and dispatcher for agent implementations."""
@@ -40,6 +42,7 @@ class AgentService:
         gate = self._get_turn_gate(runtime_key)
         await gate.lock.acquire()
         gate.token = uuid.uuid4().hex
+        gate.backend = agent.name
         self._stamp_runtime_turn(request, runtime_key, gate.token)
         # INBOUND status chokepoint (one of exactly two — the other is the outbound
         # MessageDispatcher.emit_agent_message). Every turn, every source (chat /
@@ -73,16 +76,38 @@ class AgentService:
 
     async def clear_sessions(self, session_key: str) -> Dict[str, int]:
         cleared: Dict[str, int] = {}
-        for name, agent in self.agents.items():
-            runtime_key_getter = getattr(agent, "runtime_turn_keys_for_session_key", None)
-            runtime_keys = runtime_key_getter(session_key) if callable(runtime_key_getter) else set()
-            runtime_tokens = self._runtime_turn_tokens(runtime_keys)
-            count = await agent.clear_sessions(session_key)
+        for name in list(self.agents.keys()):
+            count = await self.clear_backend_sessions(name, session_key)
             if count:
                 cleared[name] = count
-            for runtime_key, runtime_token in runtime_tokens.items():
-                self.release_runtime_turn_key(runtime_key, runtime_token)
         return cleared
+
+    async def clear_backend_sessions(self, agent_name: str, session_key: str) -> int:
+        agent = self.get(agent_name)
+        runtime_key_getter = getattr(agent, "runtime_turn_keys_for_session_key", None)
+        runtime_keys = runtime_key_getter(session_key) if callable(runtime_key_getter) else set()
+        runtime_tokens = self._runtime_turn_tokens(runtime_keys, backend=agent.name)
+        count = await agent.clear_sessions(session_key)
+        for runtime_key, runtime_token in runtime_tokens.items():
+            self.release_runtime_turn_key(runtime_key, runtime_token)
+        return count
+
+    def release_runtime_turns_for_backend(self, agent_name: str) -> None:
+        runtime_tokens = self.runtime_turn_tokens_for_backend(agent_name)
+        self.release_runtime_turn_tokens(runtime_tokens)
+
+    def runtime_turn_tokens_for_backend(self, agent_name: str) -> dict[str, str]:
+        agent = self.agents.get(agent_name)
+        backend = agent.name if agent is not None else agent_name
+        return {
+            runtime_key: gate.token
+            for runtime_key, gate in self._turn_gates.items()
+            if gate.backend == backend and gate.token
+        }
+
+    def release_runtime_turn_tokens(self, runtime_tokens: dict[str, str]) -> None:
+        for runtime_key, runtime_token in runtime_tokens.items():
+            self.release_runtime_turn_key(runtime_key, runtime_token)
 
     async def handle_stop(self, agent_name: str, request: AgentRequest) -> bool:
         agent = self.get(agent_name)
@@ -90,7 +115,10 @@ class AgentService:
         gate = self._turn_gates.get(runtime_key)
         if gate is not None and gate.token:
             self._stamp_runtime_turn(request, runtime_key, gate.token)
-        return await agent.handle_stop(request)
+        handled = await agent.handle_stop(request)
+        if not handled and getattr(request, "stop_failure_reason", None) in STALE_STOP_REASONS:
+            self.release_runtime_turn(request.context)
+        return handled
 
     def release_runtime_turn(self, context: Any) -> None:
         payload = getattr(context, "platform_specific", None) or {}
@@ -113,6 +141,7 @@ class AgentService:
         if runtime_token is not None and gate.token != runtime_token:
             return
         gate.token = ""
+        gate.backend = ""
         if gate.lock.locked():
             gate.lock.release()
 
@@ -141,12 +170,15 @@ class AgentService:
             or "default"
         )
 
-    def _runtime_turn_tokens(self, runtime_keys: set[str]) -> dict[str, str]:
+    def _runtime_turn_tokens(self, runtime_keys: set[str], *, backend: str | None = None) -> dict[str, str]:
         tokens = {}
         for runtime_key in runtime_keys:
             gate = self._turn_gates.get(runtime_key)
-            if gate is not None and gate.token:
-                tokens[runtime_key] = gate.token
+            if gate is None or not gate.token:
+                continue
+            if backend is not None and gate.backend != backend:
+                continue
+            tokens[runtime_key] = gate.token
         return tokens
 
     @staticmethod
@@ -173,11 +205,16 @@ class AgentService:
         refresh = getattr(agent, "refresh_runtime_config", None)
         if not callable(refresh):
             return False
-        await refresh(runtime_config)
-        return True
+        runtime_tokens = self.runtime_turn_tokens_for_backend(agent.name)
+        try:
+            await refresh(runtime_config)
+            return True
+        finally:
+            self.release_runtime_turn_tokens(runtime_tokens)
 
 
 @dataclass
 class _RuntimeTurnGate:
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     token: str = ""
+    backend: str = ""

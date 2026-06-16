@@ -46,6 +46,53 @@ def test_dispatch_to_controller_loop_runs_callback_on_controller_loop():
     assert result["value"] == "hello"
 
 
+def test_dispatch_to_controller_loop_background_returns_before_callback_finishes():
+    controller = Controller.__new__(Controller)
+    loop = asyncio.new_event_loop()
+    controller._loop = loop
+    callback_started = threading.Event()
+    callback_can_finish = threading.Event()
+    result: dict[str, object] = {}
+
+    async def callback(value: str) -> None:
+        result["thread"] = threading.current_thread().name
+        result["loop"] = asyncio.get_running_loop()
+        result["value"] = value
+        callback_started.set()
+        await asyncio.to_thread(callback_can_finish.wait)
+        result["finished"] = True
+
+    wrapped = Controller._dispatch_to_controller_loop_background(controller, callback)
+
+    def _loop_runner() -> None:
+        asyncio.set_event_loop(loop)
+        loop.run_forever()
+
+    loop_thread = threading.Thread(target=_loop_runner, name="controller-loop", daemon=True)
+    loop_thread.start()
+
+    async def _invoke() -> None:
+        await asyncio.wait_for(wrapped("hello"), timeout=0.2)
+
+    try:
+        asyncio.run(_invoke())
+        assert callback_started.wait(timeout=1)
+        assert "finished" not in result
+        callback_can_finish.set()
+        deadline = loop.time() + 2
+        while "finished" not in result and loop.time() < deadline:
+            threading.Event().wait(0.01)
+    finally:
+        callback_can_finish.set()
+        loop.call_soon_threadsafe(loop.stop)
+        loop_thread.join(timeout=2)
+        loop.close()
+
+    assert result["finished"] is True
+    assert result["thread"] == "controller-loop"
+    assert result["value"] == "hello"
+
+
 def test_cleanup_sync_stops_watch_service_on_stopped_loop() -> None:
     controller = Controller.__new__(Controller)
     loop = asyncio.new_event_loop()

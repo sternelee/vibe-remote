@@ -1,6 +1,7 @@
 """Core controller that coordinates between modules and handlers"""
 
 import asyncio
+import concurrent.futures
 import json
 import logging
 import threading
@@ -677,7 +678,7 @@ class Controller:
 
         # Register callbacks with the IM client
         self.im_client.register_callbacks(
-            on_message=self._dispatch_to_controller_loop(_on_im_message),
+            on_message=self._dispatch_to_controller_loop_background(_on_im_message),
             on_command=command_handlers,
             on_callback_query=self._dispatch_to_controller_loop(self.message_handler.handle_callback_query),
             on_settings_update=self._dispatch_to_controller_loop(self.settings_handler.handle_settings_update),
@@ -708,6 +709,44 @@ class Controller:
             return await asyncio.wrap_future(future)
 
         return _wrapped
+
+    def _dispatch_to_controller_loop_background(self, callback):
+        async def _wrapped(*args, **kwargs):
+            self._schedule_controller_callback(callback, *args, **kwargs)
+
+        return _wrapped
+
+    def _schedule_controller_callback(self, callback, *args, **kwargs) -> None:
+        async def _runner():
+            await callback(*args, **kwargs)
+
+        loop = self._loop
+        if loop is None:
+            task = asyncio.create_task(_runner())
+            task.add_done_callback(self._log_background_callback_result)
+            return
+
+        try:
+            current_loop = asyncio.get_running_loop()
+        except RuntimeError:
+            current_loop = None
+
+        if current_loop is loop:
+            task = loop.create_task(_runner())
+            task.add_done_callback(self._log_background_callback_result)
+            return
+
+        future = asyncio.run_coroutine_threadsafe(_runner(), loop)
+        future.add_done_callback(self._log_background_callback_result)
+
+    @staticmethod
+    def _log_background_callback_result(future) -> None:
+        try:
+            future.result()
+        except (asyncio.CancelledError, concurrent.futures.CancelledError):
+            return
+        except Exception:
+            logger.error("Background IM message callback failed", exc_info=True)
 
     def _run_im_runtime(self) -> None:
         try:

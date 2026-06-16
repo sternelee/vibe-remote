@@ -80,6 +80,9 @@ class OpenCodeSessionManager:
             if len(info) >= 3 and info[2] == session_key
         }
 
+    def list_all(self) -> Dict[str, RequestSessionTuple]:
+        return dict(self._request_sessions)
+
     def _set_request_agent_session_id(self, request: AgentRequest, agent_session_id: Optional[str]) -> None:
         if not agent_session_id:
             return
