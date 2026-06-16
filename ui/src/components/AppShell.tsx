@@ -217,10 +217,14 @@ export const AppShell: React.FC = () => {
     { to: '/more', label: t('nav.more'), icon: Menu, match: (p) => p.startsWith('/more') },
   ];
 
-  // Chat is a full-screen detail (own composer); the wizard owns the whole
-  // viewport. Hide the bottom tab bar on both.
+  // Chat is a full-screen detail (own composer) and Search is a full-screen
+  // focused surface (own header + back button); the wizard owns the whole
+  // viewport. These mobile surfaces render their own top chrome, so the shell's
+  // mobile brand header AND the bottom tab bar are hidden on them.
   const isChat = location.pathname.startsWith('/chat/');
-  const showBottomNav = !isChat && location.pathname !== '/setup';
+  const isSearch = location.pathname === '/search';
+  const isFullScreenMobile = isChat || isSearch;
+  const showBottomNav = !isFullScreenMobile && location.pathname !== '/setup';
 
   return (
     // Mobile: a LOCKED, full-viewport flex column (overflow-hidden) so the
@@ -329,9 +333,10 @@ export const AppShell: React.FC = () => {
         </div>
       </aside>
 
-      {/* Chat is a fixed full-screen surface with its own header bar, so the
-          brand header is hidden there (otherwise it would sit behind the chat). */}
-      {!isChat && (
+      {/* Chat and Search are fixed full-screen surfaces with their own header
+          bars, so the brand header is hidden there (otherwise it would sit
+          behind them). */}
+      {!isFullScreenMobile && (
         <header className="sticky top-0 z-40 flex h-[calc(4rem+env(safe-area-inset-top))] shrink-0 items-center justify-between gap-2 border-b border-border bg-background/92 px-4 pt-[env(safe-area-inset-top)] backdrop-blur md:hidden">
           <div className="flex min-w-0 items-center gap-2">
             <img

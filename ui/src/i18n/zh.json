@@ -15,6 +15,7 @@
     "edit": "编辑",
     "configure": "配置",
     "cancel": "取消",
+    "clear": "清除",
     "loading": "加载中...",
     "saving": "保存中...",
     "saved": "已保存",
@@ -639,7 +640,8 @@
       "kbdNavigate": "切换",
       "kbdOpen": "打开",
       "kbdClose": "关闭",
-      "footerNote": "搜索消息内容 · 全部会话"
+      "footerNote": "搜索消息内容 · 全部会话",
+      "scopeAll": "全部会话"
     },
     "inbox": {
       "eyebrow": "收件箱",

@@ -1,7 +1,7 @@
 import { useMemo, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { useNavigate } from 'react-router-dom';
-import { ArrowRight, CheckCheck, Filter, Inbox, Loader2, MessageSquareReply, RefreshCw } from 'lucide-react';
+import { ArrowRight, CheckCheck, Filter, Inbox, Loader2, MessageSquareReply, RefreshCw, Search } from 'lucide-react';
 import clsx from 'clsx';
 
 import { useWorkbenchInbox } from '../../context/WorkbenchInboxContext';
@@ -95,6 +95,22 @@ export const InboxPage: React.FC = () => {
           </button>
         </div>
       </div>
+
+      {/* Mobile search entry — a full-width field-style button that opens the
+          full-screen search page (design.pen S5H9R "M · Inbox · Search entry";
+          SearchField). Mobile-only: desktop searches via the sidebar field + ⌘K
+          (md:hidden). */}
+      <button
+        type="button"
+        onClick={() => navigate('/search')}
+        className="flex w-full items-center gap-2.5 rounded-xl border border-border-strong bg-foreground/[0.04] px-3.5 py-2.5 text-left transition hover:bg-foreground/[0.06] md:hidden"
+      >
+        <Search className="size-4 shrink-0 text-muted" />
+        <span className="flex-1 truncate text-[14px] text-muted">
+          {t('workbench.search.entry')}
+        </span>
+        <span className="shrink-0 text-[11px] text-muted">{t('workbench.search.scopeAll')}</span>
+      </button>
 
       {/* Toolbar */}
       <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:gap-2">

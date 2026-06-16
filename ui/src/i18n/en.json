@@ -15,6 +15,7 @@
     "edit": "Edit",
     "configure": "Configure",
     "cancel": "Cancel",
+    "clear": "Clear",
     "loading": "Loading...",
     "saving": "Saving...",
     "saved": "Saved",
@@ -639,7 +640,8 @@
       "kbdNavigate": "Navigate",
       "kbdOpen": "Open",
       "kbdClose": "Close",
-      "footerNote": "Searching message content · all sessions"
+      "footerNote": "Searching message content · all sessions",
+      "scopeAll": "all sessions"
     },
     "inbox": {
       "eyebrow": "Inbox",
