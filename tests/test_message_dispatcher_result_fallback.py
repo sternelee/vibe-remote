@@ -272,6 +272,38 @@ class MessageDispatcherResultFallbackTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(controller.im_client.sent_messages, [])
         persist.assert_not_called()
 
+    async def test_result_releases_runtime_gate_after_result_cleanup(self):
+        controller = _StubController(platform="slack")
+        events = []
+
+        class _AgentService:
+            @staticmethod
+            def emit_matches_runtime_turn(_context):
+                return True
+
+            @staticmethod
+            def release_runtime_turn(_context):
+                events.append("release")
+
+        controller.agent_service = _AgentService()
+        dispatcher = ConsolidatedMessageDispatcher(controller)
+
+        async def _clear_consolidated_state(_context):
+            events.append("clear")
+
+        dispatcher._clear_consolidated_state = _clear_consolidated_state
+        context = MessageContext(
+            user_id="U1",
+            channel_id="C1",
+            platform="slack",
+            platform_specific={"agent_runtime_turn_key": "s:/repo", "agent_runtime_turn_token": "tok"},
+        )
+
+        with mock.patch("core.message_dispatcher.persist_agent_message"):
+            await dispatcher.emit_agent_message(context, "result", "done")
+
+        self.assertEqual(events, ["clear", "release"])
+
     async def test_muted_log_message_still_persists(self):
         """assistant / tool_call rows persist BEFORE the mute filter, so a muted
         process log still lands in the store (product requirement)."""

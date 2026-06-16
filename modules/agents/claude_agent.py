@@ -758,20 +758,13 @@ class ClaudeAgent(BaseAgent):
             return
 
         pending_request = pending_requests[0]
-        context_token = str((getattr(context, "platform_specific", None) or {}).get(AGENT_RUNTIME_TURN_TOKEN) or "")
         pending_token = str(
             (getattr(getattr(pending_request, "context", None), "platform_specific", None) or {}).get(
                 AGENT_RUNTIME_TURN_TOKEN
             )
             or ""
         )
-        if not context_token or not pending_token:
-            return
-        if context_token and pending_token and context_token != pending_token:
-            logger.info(
-                "Ignoring Claude receiver EOF for %s because a newer runtime turn is pending",
-                composite_key,
-            )
+        if not pending_token:
             return
         logger.warning("Claude receiver ended without a result for session %s", composite_key)
         self._adopt_pending_turn_token(context, pending_request)

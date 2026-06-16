@@ -29,6 +29,11 @@ class _RuntimeAgent:
         return False
 
 
+class _RaisingRuntimeAgent(_RuntimeAgent):
+    async def handle_message(self, _request):
+        raise RuntimeError("backend failed")
+
+
 class _ClearingRuntimeAgent:
     name = "codex"
 
@@ -192,5 +197,30 @@ def test_agent_service_clear_sessions_does_not_release_new_turn_token() -> None:
         assert service._turn_gates[runtime_key].token == "new-token"
 
         service.release_runtime_turn_key(runtime_key, "new-token")
+
+    asyncio.run(_run())
+
+
+def test_agent_service_releases_gate_when_exception_terminal_emit_fails() -> None:
+    async def _run():
+        controller = _Controller()
+
+        async def _emit(*_args, **_kwargs):
+            raise RuntimeError("send failed")
+
+        controller.emit_agent_message = _emit
+        service = AgentService(controller=controller)
+        agent = _RaisingRuntimeAgent()
+        service.register(agent)
+        request = _request("boom")
+
+        try:
+            await service.handle_message("claude", request)
+        except RuntimeError as err:
+            assert str(err) == "backend failed"
+        else:
+            raise AssertionError("backend exception should escape")
+
+        assert not service._turn_gates["session:/repo"].lock.locked()
 
     asyncio.run(_run())

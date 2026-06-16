@@ -1443,6 +1443,71 @@ class ClaudeAgentSessionTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn(composite_key, controller.claude_sessions)
         self.assertNotIn(composite_key, agent._pending_requests)
 
+    async def test_receiver_eof_adopts_pending_turn_token_when_context_is_stale(self):
+        controller = _StubController()
+        controller._get_session_key = lambda context: "telegram::user::U1"
+        agent = ClaudeAgent(controller)
+        service = AgentService(controller)
+        service.register(agent)
+        controller.agent_service = service
+
+        async def _emit(context, message_type, text, **_kwargs):
+            if message_type == "result":
+                service.release_runtime_turn(context)
+
+        controller.emit_agent_message = AsyncMock(side_effect=_emit)
+        composite_key = "session-1:/tmp/work"
+        context = SimpleNamespace(
+            user_id="U1",
+            channel_id="C1",
+            platform_specific={
+                "turn_token": "old-turn",
+                "agent_runtime_turn_key": composite_key,
+                "agent_runtime_turn_token": "old-runtime",
+            },
+        )
+        pending_request = SimpleNamespace(
+            context=SimpleNamespace(
+                platform_specific={
+                    "turn_token": "current-turn",
+                    "agent_runtime_turn_key": composite_key,
+                    "agent_runtime_turn_token": "current-runtime",
+                }
+            ),
+            ack_reaction_message_id=None,
+            ack_reaction_emoji=None,
+        )
+        agent._pending_requests[composite_key] = [pending_request]
+        gate = service._get_turn_gate(composite_key)
+        await gate.lock.acquire()
+        gate.token = "current-runtime"
+
+        class _Client:
+            async def disconnect(self):
+                return None
+
+            def receive_messages(self):
+                async def _iterate():
+                    if False:
+                        yield None
+
+                return _iterate()
+
+        client = _Client()
+        controller.claude_sessions[composite_key] = client
+        receiver_task = asyncio.create_task(
+            agent._receive_messages(client, "session-1", "/tmp/work", context, composite_key=composite_key)
+        )
+        controller.receiver_tasks[composite_key] = receiver_task
+
+        await asyncio.wait_for(receiver_task, timeout=1)
+
+        controller.emit_agent_message.assert_awaited_once_with(context, "result", "", is_error=True)
+        self.assertEqual(context.platform_specific["turn_token"], "current-turn")
+        self.assertEqual(context.platform_specific["agent_runtime_turn_token"], "current-runtime")
+        self.assertFalse(service._turn_gates[composite_key].lock.locked())
+        self.assertNotIn(composite_key, agent._pending_requests)
+
     async def test_assistant_auth_error_prefers_oauth_recovery_message(self):
         controller = _StubController()
         controller.agent_auth_service.maybe_emit_auth_recovery_message = AsyncMock(return_value=True)

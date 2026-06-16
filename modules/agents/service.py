@@ -57,9 +57,18 @@ class AgentService:
             raise
         except Exception:
             # The message handler converts backend exceptions into a terminal
-            # error result using the same context. Keep the gate current so that
-            # result is delivered and releases the runtime turn through the
-            # shared dispatcher path.
+            # error result using the same context. Try that shared terminal path
+            # here too; if delivery itself is broken, the finally below still
+            # releases this turn's token so later prompts cannot hang forever.
+            try:
+                emit = getattr(self.controller, "emit_agent_message", None)
+                if callable(emit):
+                    try:
+                        await emit(request.context, "result", "", is_error=True, level="silent")
+                    except Exception:
+                        logger.debug("Failed to emit terminal result for backend exception", exc_info=True)
+            finally:
+                self.release_runtime_turn(request.context)
             raise
 
     async def clear_sessions(self, session_key: str) -> Dict[str, int]:
