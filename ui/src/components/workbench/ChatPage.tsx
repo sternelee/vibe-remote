@@ -600,6 +600,15 @@ export const ChatPage: React.FC = () => {
       onMessageNew: (msg) => {
         if (msg.session_id !== sessionIdRef.current) return;
         if (!isTranscriptMessage(msg)) return;
+        // Around-jump window active (a search jump landed away from the live
+        // tail): the transcript is a centered window with a deliberate gap to
+        // the tail. Appending a newly-arriving tail row here would graft a
+        // disjoint row below the historical window, so scrolling down would
+        // skip the intervening history. Skip the append — mirrors the reconcile
+        // guard above. The skipped rows are picked up when the user catches up
+        // to the tail (jump-to-latest reloads the tail; load-newer pages reach
+        // it), so nothing is lost (Codex P2).
+        if (newerCursorRef.current) return;
         appendMessage(msg);
         // Don't clear ``working`` from a result row here: with the queue, a
         // result can belong to an EARLIER turn while a newer queued turn is
@@ -1085,6 +1094,17 @@ export const ChatPage: React.FC = () => {
       cancelled = true;
     };
   }, [deepLinkMessageId, sessionId, loading, session, api, startHighlight, setSearchParams]);
+
+  // Re-arm the jump guard once ``?msg=`` is gone. ``clearParam`` (above) nulls
+  // the param after handling, so without this re-selecting the SAME search hit
+  // (which re-adds the same ``?msg=``) would be treated as already-handled and
+  // the jump effect would exit without scrolling/highlighting. The jump effect
+  // sets ``handledJumpRef`` BEFORE clearing the param, so this reset only
+  // re-enables the NEXT navigation to that id — it can't double-fire the
+  // current jump.
+  useEffect(() => {
+    if (!deepLinkMessageId) handledJumpRef.current = null;
+  }, [deepLinkMessageId]);
 
   // Clear a pending highlight timer on unmount so it can't fire after teardown.
   useEffect(() => {

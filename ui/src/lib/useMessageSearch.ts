@@ -51,6 +51,12 @@ export function useMessageSearch(
       return;
     }
 
+    // Drop the PREVIOUS query's hits immediately (before the debounce/fetch) so
+    // the palette/page never render — and let the user select — stale rows under
+    // a changed query (Enter/tap could otherwise open a non-matching message).
+    // The loading spinner covers the gap until the new results resolve; the
+    // seq guard below still protects against out-of-order responses.
+    setResults(null);
     setLoading(true);
     setError(null);
 
