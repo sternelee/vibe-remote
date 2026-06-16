@@ -43,7 +43,7 @@ class AgentService:
         await gate.lock.acquire()
         gate.token = uuid.uuid4().hex
         gate.backend = agent.name
-        gate.running = True
+        gate.runtime_started = False
         self._stamp_runtime_turn(request, runtime_key, gate.token)
         try:
             # INBOUND status chokepoint (one of exactly two — the other is the outbound
@@ -122,10 +122,21 @@ class AgentService:
             and getattr(request, "stop_failure_reason", None) in STALE_STOP_REASONS
             and gate is not None
             and gate.token
-            and not gate.running
+            and gate.runtime_started
         ):
             self.release_runtime_turn(request.context)
         return handled
+
+    def mark_runtime_turn_started(self, context: Any) -> None:
+        payload = getattr(context, "platform_specific", None) or {}
+        runtime_key = str(payload.get(AGENT_RUNTIME_TURN_KEY) or "").strip()
+        runtime_token = str(payload.get(AGENT_RUNTIME_TURN_TOKEN) or "").strip()
+        if not runtime_key or not runtime_token:
+            return
+        gate = self._turn_gates.get(runtime_key)
+        if gate is None or gate.token != runtime_token:
+            return
+        gate.runtime_started = True
 
     def release_runtime_turn(self, context: Any) -> None:
         payload = getattr(context, "platform_specific", None) or {}
@@ -149,7 +160,7 @@ class AgentService:
             return
         gate.token = ""
         gate.backend = ""
-        gate.running = False
+        gate.runtime_started = False
         if gate.lock.locked():
             gate.lock.release()
 
@@ -226,4 +237,4 @@ class _RuntimeTurnGate:
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     token: str = ""
     backend: str = ""
-    running: bool = False
+    runtime_started: bool = False

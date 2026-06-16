@@ -312,6 +312,7 @@ class OpenCodeAgent(OpenCodeMessageProcessorMixin, BaseAgent):
             )
             await server.mark_run_active(session_id)
             run_registered = True
+            self.mark_runtime_turn_started(request.context)
 
             logger.info(
                 "Starting OpenCode poll loop for %s (thread=%s, cwd=%s)",

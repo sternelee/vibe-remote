@@ -113,6 +113,18 @@ class BaseAgent(ABC):
         """Return runtime identities scoped to a persisted Avibe settings key."""
         return set()
 
+    def mark_runtime_turn_started(self, context: Any) -> None:
+        """Mark the current gated turn as accepted by the backend runtime.
+
+        AgentService uses this to distinguish a startup-window stop (backend has
+        not accepted the turn yet) from a stale stop after the backend lost an
+        accepted turn.
+        """
+        service = getattr(self.controller, "agent_service", None)
+        mark_started = getattr(service, "mark_runtime_turn_started", None)
+        if callable(mark_started):
+            mark_started(context)
+
     def ensure_agent_session_id(
         self,
         request: AgentRequest,

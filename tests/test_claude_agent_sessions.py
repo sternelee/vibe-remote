@@ -765,6 +765,29 @@ class ClaudeAgentSessionTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn(session_key, controller.claude_sessions)
         self.assertEqual(controller.session_manager.cleared, ["wechat-user"])
 
+    async def test_clear_sessions_cancels_subagent_runtime_keys_for_cleared_session(self):
+        controller = _StubController()
+        agent = ClaudeAgent(controller)
+        session_key = "wechat_o9:reviewer:/tmp/work"
+        client = _StubClient()
+        controller.claude_sessions[session_key] = client
+
+        cleared = await agent.clear_sessions("wechat-user")
+
+        self.assertEqual(cleared, 1)
+        self.assertTrue(client.disconnected)
+        self.assertNotIn(session_key, controller.claude_sessions)
+
+    async def test_runtime_turn_keys_for_session_key_matches_subagent_runtime_keys(self):
+        controller = _StubController()
+        agent = ClaudeAgent(controller)
+        controller.claude_sessions["wechat_o9:reviewer:/tmp/work"] = _StubClient()
+        controller.claude_sessions["other:/tmp/work"] = _StubClient()
+
+        keys = agent.runtime_turn_keys_for_session_key("wechat-user")
+
+        self.assertEqual(keys, {"wechat_o9:reviewer:/tmp/work"})
+
     async def test_clear_sessions_swallows_receiver_task_failure(self):
         controller = _StubController()
         agent = ClaudeAgent(controller)
@@ -1442,6 +1465,70 @@ class ClaudeAgentSessionTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(service._turn_gates[composite_key].lock.locked())
         self.assertNotIn(composite_key, controller.claude_sessions)
         self.assertNotIn(composite_key, agent._pending_requests)
+
+    async def test_receiver_eof_cleans_runtime_before_terminal_emit_releases_gate(self):
+        controller = _StubController()
+        controller._get_session_key = lambda context: "telegram::user::U1"
+        agent = ClaudeAgent(controller)
+        service = AgentService(controller)
+        service.register(agent)
+        controller.agent_service = service
+        composite_key = "session-1:/tmp/work"
+        release_seen_state: dict[str, bool] = {}
+
+        async def _emit(context, message_type, text, **_kwargs):
+            if message_type == "result":
+                release_seen_state["client_present"] = composite_key in controller.claude_sessions
+                release_seen_state["receiver_present"] = composite_key in controller.receiver_tasks
+                service.release_runtime_turn(context)
+
+        controller.emit_agent_message = AsyncMock(side_effect=_emit)
+        context = SimpleNamespace(
+            user_id="U1",
+            channel_id="C1",
+            platform_specific={
+                "agent_runtime_turn_key": composite_key,
+                "agent_runtime_turn_token": "R1",
+            },
+        )
+        pending_request = SimpleNamespace(
+            context=SimpleNamespace(
+                platform_specific={
+                    "turn_token": "T1",
+                    "agent_runtime_turn_key": composite_key,
+                    "agent_runtime_turn_token": "R1",
+                }
+            ),
+            ack_reaction_message_id=None,
+            ack_reaction_emoji=None,
+        )
+        agent._pending_requests[composite_key] = [pending_request]
+        gate = service._get_turn_gate(composite_key)
+        await gate.lock.acquire()
+        gate.token = "R1"
+
+        class _Client:
+            async def disconnect(self):
+                return None
+
+            def receive_messages(self):
+                async def _iterate():
+                    if False:
+                        yield None
+
+                return _iterate()
+
+        client = _Client()
+        controller.claude_sessions[composite_key] = client
+        receiver_task = asyncio.create_task(
+            agent._receive_messages(client, "session-1", "/tmp/work", context, composite_key=composite_key)
+        )
+        controller.receiver_tasks[composite_key] = receiver_task
+
+        await asyncio.wait_for(receiver_task, timeout=1)
+
+        self.assertEqual(release_seen_state, {"client_present": False, "receiver_present": False})
+        self.assertFalse(service._turn_gates[composite_key].lock.locked())
 
     async def test_receiver_eof_adopts_pending_turn_token_when_context_is_stale(self):
         controller = _StubController()

@@ -251,6 +251,36 @@ def test_agent_service_clear_sessions_does_not_release_new_turn_token() -> None:
     asyncio.run(_run())
 
 
+def test_agent_service_marks_runtime_started_from_matching_context_only() -> None:
+    service = AgentService(controller=_Controller())
+    runtime_key = "session:/repo"
+    gate = service._get_turn_gate(runtime_key)
+    gate.token = "runtime-token"
+    gate.backend = "claude"
+    context = SimpleNamespace(
+        platform_specific={
+            "agent_runtime_turn_key": runtime_key,
+            "agent_runtime_turn_token": "runtime-token",
+        }
+    )
+
+    service.mark_runtime_turn_started(context)
+
+    assert gate.runtime_started is True
+
+    stale_context = SimpleNamespace(
+        platform_specific={
+            "agent_runtime_turn_key": runtime_key,
+            "agent_runtime_turn_token": "old-token",
+        }
+    )
+    gate.runtime_started = False
+
+    service.mark_runtime_turn_started(stale_context)
+
+    assert gate.runtime_started is False
+
+
 def test_agent_service_clear_backend_sessions_does_not_release_other_backend_gate() -> None:
     async def _run():
         service = AgentService(controller=_Controller())
@@ -305,7 +335,7 @@ def test_agent_service_releases_runtime_gate_for_stale_stop() -> None:
         await gate.lock.acquire()
         gate.token = "stop-token"
         gate.backend = "claude"
-        gate.running = False
+        gate.runtime_started = True
 
         handled = await service.handle_stop("claude", request)
 
@@ -326,7 +356,7 @@ def test_agent_service_keeps_runtime_gate_for_startup_window_stop() -> None:
         await gate.lock.acquire()
         gate.token = "stop-token"
         gate.backend = "codex"
-        gate.running = True
+        gate.runtime_started = False
 
         handled = await service.handle_stop("claude", request)
 
@@ -348,7 +378,7 @@ def test_agent_service_keeps_runtime_gate_for_interrupt_failure_stop() -> None:
         await gate.lock.acquire()
         gate.token = "stop-token"
         gate.backend = "claude"
-        gate.running = True
+        gate.runtime_started = True
 
         handled = await service.handle_stop("claude", request)
 
@@ -378,7 +408,7 @@ def test_agent_service_releases_gate_when_on_running_fails() -> None:
         gate = service._turn_gates["session:/repo"]
         assert not gate.lock.locked()
         assert gate.token == ""
-        assert gate.running is False
+        assert gate.runtime_started is False
         assert agent.started == []
 
     asyncio.run(_run())

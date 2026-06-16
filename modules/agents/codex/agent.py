@@ -929,6 +929,7 @@ class CodexAgent(BaseAgent):
             raise RuntimeError("Codex turn/start returned no turn id")
 
         turn_state = self._turn_registry.finalize_turn_start_response(turn_id, request)
+        self._mark_runtime_turn_started(getattr(request, "context", None))
         bind_generated_image_snapshot = getattr(event_handler, "bind_generated_image_snapshot", None)
         if callable(bind_generated_image_snapshot):
             bind_generated_image_snapshot(thread_id, turn_id, request.base_session_id)
@@ -940,6 +941,12 @@ class CodexAgent(BaseAgent):
             "registered" if turn_state else "already-finished",
         )
         return thread_id
+
+    def _mark_runtime_turn_started(self, context: Any) -> None:
+        service = getattr(getattr(self, "controller", None), "agent_service", None)
+        mark_started = getattr(service, "mark_runtime_turn_started", None)
+        if callable(mark_started):
+            mark_started(context)
 
     # ------------------------------------------------------------------
     # Input building

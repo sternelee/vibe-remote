@@ -114,6 +114,7 @@ class ClaudeAgent(BaseAgent):
             message = self._prepare_message_with_files(request)
 
             await client.query(message, session_id=runtime_session_key)
+            self.mark_runtime_turn_started(context)
             if (
                 runtime_session_key not in self.receiver_tasks
                 or self.receiver_tasks[runtime_session_key].done()
@@ -207,8 +208,7 @@ class ClaudeAgent(BaseAgent):
 
         sessions_to_clear = []
         for composite_id in list(self.claude_sessions.keys()):
-            base_part = composite_id.split(":")[0] if ":" in composite_id else composite_id
-            if base_part in session_bases_to_clear:
+            if self._runtime_key_matches_session_base(composite_id, session_bases_to_clear):
                 sessions_to_clear.append(composite_id)
 
         for composite_id in sessions_to_clear:
@@ -224,13 +224,19 @@ class ClaudeAgent(BaseAgent):
         session_bases_to_clear = set(agent_map.keys())
         runtime_keys = set()
         for composite_id in self.runtime_turn_keys():
-            base_part = composite_id.split(":", 1)[0] if ":" in composite_id else composite_id
-            if base_part in session_bases_to_clear:
+            if self._runtime_key_matches_session_base(composite_id, session_bases_to_clear):
                 runtime_keys.add(composite_id)
         return runtime_keys
 
     def runtime_turn_keys(self) -> set[str]:
         return set(self.claude_sessions.keys()) | set(self.receiver_tasks.keys())
+
+    @staticmethod
+    def _runtime_key_matches_session_base(runtime_key: str, session_bases: set[str]) -> bool:
+        for session_base in session_bases:
+            if runtime_key == session_base or runtime_key.startswith(f"{session_base}:"):
+                return True
+        return False
 
     async def refresh_auth_state(self) -> None:
         """Reconnect Claude runtime so future requests load fresh auth."""
@@ -775,15 +781,15 @@ class ClaudeAgent(BaseAgent):
         self._pending_assistant_message.pop(composite_key, None)
         self._mark_session_idle_if_no_pending_requests(composite_key)
 
+        await self._cleanup_runtime_session(
+            composite_key,
+            current_receiver_task=asyncio.current_task(),
+            preserve_pending_request_state=True,
+        )
         try:
             await self.controller.emit_agent_message(context, "result", "", is_error=True)
         finally:
             self._release_service_runtime_turn(context)
-            await self._cleanup_runtime_session(
-                composite_key,
-                current_receiver_task=asyncio.current_task(),
-                preserve_pending_request_state=True,
-            )
 
     async def _handle_synthetic_api_error_message(
         self,

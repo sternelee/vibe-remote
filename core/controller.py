@@ -714,17 +714,32 @@ class Controller:
         tracked_platforms = {"telegram", "wechat"}
 
         async def _wrapped(context, *args, **kwargs):
-            platform = str(
-                getattr(context, "platform", None)
-                or (getattr(context, "platform_specific", None) or {}).get("platform")
-                or ""
-            )
+            platform = self._platform_for_im_callback_context(context)
             if platform in tracked_platforms:
                 return await self._run_on_controller_loop(callback, context, *args, **kwargs)
             self._schedule_controller_callback(callback, context, *args, **kwargs)
             return None
 
         return _wrapped
+
+    def _platform_for_im_callback_context(self, context) -> str:
+        platform = str(
+            getattr(context, "platform", None)
+            or (getattr(context, "platform_specific", None) or {}).get("platform")
+            or ""
+        ).strip()
+        if platform:
+            return platform
+        im_client = getattr(self, "im_client", None)
+        primary_platform = str(getattr(im_client, "primary_platform", "") or "").strip()
+        if primary_platform:
+            return primary_platform
+        module = str(getattr(type(im_client), "__module__", "") or "")
+        if module.startswith("modules.im.wechat"):
+            return "wechat"
+        if module.startswith("modules.im.telegram"):
+            return "telegram"
+        return ""
 
     def _dispatch_to_controller_loop_background(self, callback):
         async def _wrapped(*args, **kwargs):
