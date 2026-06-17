@@ -24,7 +24,11 @@ export const ShowPageShareControl: React.FC<{
   // Lets the chat view re-point the iframe at the route that now serves the
   // page when visibility flips (private↔public swap the serving route).
   onPayloadChange?: (payload: ShowPageLinkInfo) => void;
-}> = ({ sessionId, onPayloadChange }) => {
+  // The popover floats over the Show Page iframe; the chat view makes the iframe
+  // inert while it is open so an outside tap there falls through to the parent
+  // document and Radix can dismiss (a tap inside an iframe never reaches us).
+  onOpenChange?: (open: boolean) => void;
+}> = ({ sessionId, onPayloadChange, onOpenChange }) => {
   const { t } = useTranslation();
   const api = useApi();
   const [open, setOpen] = useState(false);
@@ -41,6 +45,11 @@ export const ShowPageShareControl: React.FC<{
   useEffect(() => {
     if (payload) onPayloadChange?.(payload);
   }, [payload, onPayloadChange]);
+
+  // If we unmount while open (a route/session change tears down Show Page mode),
+  // Radix won't fire onOpenChange, so report closed here — otherwise the chat
+  // view would keep the iframe inert (pointer-events:none) on the next Show Page.
+  useEffect(() => () => onOpenChange?.(false), [onOpenChange]);
 
   const offline = payload?.visibility === 'offline' || payload?.offline === true;
   const isPublic = payload?.visibility === 'public';
@@ -67,6 +76,7 @@ export const ShowPageShareControl: React.FC<{
 
   const handleOpenChange = (next: boolean) => {
     setOpen(next);
+    onOpenChange?.(next);
     if (next) refresh();
   };
 
