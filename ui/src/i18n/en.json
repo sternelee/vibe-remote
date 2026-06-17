@@ -15,6 +15,7 @@
     "edit": "Edit",
     "configure": "Configure",
     "cancel": "Cancel",
+    "clear": "Clear",
     "loading": "Loading...",
     "saving": "Saving...",
     "saved": "Saved",
@@ -628,6 +629,22 @@
       "skills": "Skills",
       "harness": "Harness",
       "vaults": "Vaults"
+    },
+    "search": {
+      "roleYou": "You",
+      "roleAgent": "Agent",
+      "title": "Search messages",
+      "entry": "Search messages",
+      "placeholder": "Search messages",
+      "hint": "Search your messages",
+      "empty": "No messages found",
+      "error": "Search failed — try again.",
+      "kbdEsc": "Esc",
+      "kbdNavigate": "Navigate",
+      "kbdOpen": "Open",
+      "kbdClose": "Close",
+      "footerNote": "Searching message content · all sessions",
+      "scopeAll": "all sessions"
     },
     "inbox": {
       "eyebrow": "Inbox",

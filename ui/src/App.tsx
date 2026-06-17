@@ -3,6 +3,7 @@ import { Wizard } from './components/Wizard';
 import { AppShell } from './components/AppShell';
 import { Workbench } from './components/Workbench';
 import { InboxPage } from './components/workbench/InboxPage';
+import { SearchPage } from './components/workbench/SearchPage';
 import { AgentsPage } from './components/workbench/AgentsPage';
 import { SkillsPage } from './components/workbench/SkillsPage';
 import { HarnessPage } from './components/workbench/HarnessPage';
@@ -259,6 +260,7 @@ function AppRoutes() {
             module screens land in later commits. */}
         <Route path="/" element={<Workbench />} />
         <Route path="/inbox" element={<InboxPage />} />
+        <Route path="/search" element={<SearchPage />} />
         <Route path="/agents" element={<AgentsPage />} />
         <Route path="/skills" element={<SkillsPage />} />
         <Route path="/harness" element={<HarnessPage />} />

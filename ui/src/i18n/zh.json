@@ -15,6 +15,7 @@
     "edit": "编辑",
     "configure": "配置",
     "cancel": "取消",
+    "clear": "清除",
     "loading": "加载中...",
     "saving": "保存中...",
     "saved": "已保存",
@@ -628,6 +629,22 @@
       "skills": "Skills",
       "harness": "Harness",
       "vaults": "Vaults"
+    },
+    "search": {
+      "roleYou": "你",
+      "roleAgent": "助手",
+      "title": "搜索消息",
+      "entry": "搜索消息",
+      "placeholder": "搜索消息",
+      "hint": "搜索你的消息",
+      "empty": "未找到消息",
+      "error": "搜索失败，请重试。",
+      "kbdEsc": "Esc",
+      "kbdNavigate": "切换",
+      "kbdOpen": "打开",
+      "kbdClose": "关闭",
+      "footerNote": "搜索消息内容 · 全部会话",
+      "scopeAll": "全部会话"
     },
     "inbox": {
       "eyebrow": "收件箱",
