@@ -101,8 +101,13 @@ export const ShowPageShareControl: React.FC<{
     }
   };
 
+  // modal: the popover floats over the Show Page iframe; without it an outside
+  // tap lands inside the iframe (a separate browsing context) and never reaches
+  // the parent document, so Radix can't detect it to dismiss. modal adds a
+  // viewport guard above the iframe that captures the tap (mobile, where the
+  // iframe fills most of the screen, hit this; desktop has parent chrome around).
   return (
-    <Popover open={open} onOpenChange={handleOpenChange}>
+    <Popover open={open} onOpenChange={handleOpenChange} modal>
       <PopoverTrigger asChild>
         <Button
           type="button"
