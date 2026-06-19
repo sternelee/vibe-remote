@@ -10,6 +10,7 @@ import {
   Folder,
   FolderOpen,
   FolderPlus,
+  GitFork,
   Loader2,
   Pencil,
   Plus,
@@ -245,13 +246,15 @@ const MobileSessionRow: React.FC<{
   onOpen: () => void;
 }> = ({ projectId, session, unread, onOpen }) => {
   const { t } = useTranslation();
-  const { renameSession, archiveSession } = useWorkbenchProjectsTree();
+  const { renameSession, archiveSession, forkSession } = useWorkbenchProjectsTree();
+  const navigate = useNavigate();
   const [menuOpen, setMenuOpen] = useState(false);
   const [archiveOpen, setArchiveOpen] = useState(false);
   const [renaming, setRenaming] = useState(false);
   const [draft, setDraft] = useState(session.title ?? '');
   const inputRef = useRef<HTMLInputElement | null>(null);
   const handledRef = useRef(false);
+  const forkingRef = useRef(false);
 
   useEffect(() => {
     if (renaming) inputRef.current?.focus();
@@ -340,6 +343,28 @@ const MobileSessionRow: React.FC<{
           >
             {t('workbench.sessionRename')}
           </MenuItem>
+          {/* Fork is hidden until the session has a native agent session to fork
+              (mirrors the desktop sidebar's fork gate). */}
+          {session.native_session_id && (
+            <MenuItem
+              icon={GitFork}
+              onClick={async () => {
+                setMenuOpen(false);
+                // The row stays mounted after the menu closes, so guard against a
+                // second tap (reopened menu) spawning a duplicate fork in flight.
+                if (forkingRef.current) return;
+                forkingRef.current = true;
+                try {
+                  const forked = await forkSession(projectId, session.id);
+                  if (forked) navigate(`/chat/${encodeURIComponent(forked.id)}`);
+                } finally {
+                  forkingRef.current = false;
+                }
+              }}
+            >
+              {t('workbench.sessionFork')}
+            </MenuItem>
+          )}
           <MenuItem
             icon={Archive}
             danger

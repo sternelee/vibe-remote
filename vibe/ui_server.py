@@ -4291,11 +4291,16 @@ def _session_fork_error_response(err: Exception):
 @app.route("/api/sessions/<session_id>/fork", methods=["POST"])
 def sessions_fork(session_id: str):
     from core.services import sessions as workbench_sessions_service
+    from core.services import settings as settings_service
     from core.services.session_fork import SessionForkError, reserve_forked_session
     from vibe.sse_broker import broker
 
     try:
-        result = reserve_forked_session(source_session_id=session_id)
+        # Use the saved global UI language (the same source other backend-generated
+        # strings use) so the forked title matches the chosen UI, not the browser's
+        # Accept-Language header which can differ from the user's selected language.
+        title_lang = settings_service.load_config_or_default().language
+        result = reserve_forked_session(source_session_id=session_id, title_lang=title_lang)
         engine = _projects_engine()
         with engine.connect() as conn:
             session = workbench_sessions_service.get_session(conn, result.session_id)
