@@ -243,6 +243,10 @@
           "label": "Show Page 运行时",
           "detail": "在你本机渲染可视化 Show 页面。"
         },
+        "tmux": {
+          "label": "tmux",
+          "detail": "持久终端运行时，用于可重连的 Web Terminal 会话。"
+        },
         "node": {
           "label": "Node.js",
           "detail": "上述运行时的共同前置依赖。"
@@ -591,6 +595,78 @@
     "cloudflared_exited": "连接器启动后立即退出。通常是 Tunnel 凭证无效或 Cloudflare 配置未生效，请重新配对后再试。",
     "cloudflared_stop_failed": "连接器暂时无法停止。请稍后重试，或在系统进程里手动结束 cloudflared。",
     "cloudflared_process_unknown": "检测到一个无法确认归属的连接器进程。为避免误杀其它进程，Avibe 没有自动处理。请手动检查 cloudflared 进程后再启动。"
+  },
+  "apps": {
+    "title": "应用",
+    "soon": "即将上线",
+    "fileBrowser": {
+      "label": "文件浏览器",
+      "desc": "浏览、查看、编辑这台机器上的文件。",
+      "placeholder": "文件浏览器正在搭建中。很快你就能在这里浏览整机文件、打开文件、直接编辑并保存。",
+      "tagline": "整机 · 查看与编辑",
+      "selectHint": "选择一个文件来查看或编辑。",
+      "empty": "这个文件夹是空的。",
+      "noPreview": "这种文件类型暂不支持应用内预览。",
+      "download": "下载",
+      "tooLarge": "文件太大,无法在浏览器里编辑。请下载后查看。",
+      "refresh": "刷新",
+      "newFolder": "新建文件夹",
+      "newFolderPrompt": "新文件夹名称",
+      "projects": "项目",
+      "system": "系统",
+      "showHidden": "显示隐藏文件",
+      "save": "保存",
+      "unsaved": "有未保存的修改",
+      "conflict": "打开后该文件在磁盘上已被改动。请先重新加载再保存,以免覆盖。",
+      "listTruncated": "当前只显示前 {{count}} 个条目。",
+      "errors": {
+        "conflict": "打开后该文件在磁盘上已被改动。请先重新加载再保存,以免覆盖。",
+        "not_found": "找不到这个路径。",
+        "permission_denied": "没有权限访问。",
+        "too_large": "这个文件太大。",
+        "file_not_utf8": "该文件不是有效的 UTF-8 文本，无法安全编辑，请改为下载。",
+        "not_dir": "这个路径不是文件夹。",
+        "not_file": "这个路径不是普通文件。",
+        "is_symlink": "这里不能编辑符号链接。",
+        "invalid_path": "请输入有效的绝对路径。",
+        "invalid_name": "请输入有效名称。",
+        "exists": "这个路径已存在。",
+        "fs_error": "文件系统操作失败。",
+        "listFailed": "无法列出这个文件夹。",
+        "openFailed": "无法打开这个项目。",
+        "createFolderFailed": "无法创建文件夹。",
+        "loadFailed": "无法加载这个文件。",
+        "saveFailed": "无法保存这个文件。"
+      }
+    },
+    "terminal": {
+      "label": "终端",
+      "desc": "在浏览器里跑真实 shell。",
+      "placeholder": "终端将在第二阶段上线:真实 shell,配 tmux 持久化会话。",
+      "tagline": "在浏览器里跑真实 shell。",
+      "persistent": "持久会话",
+      "reconnect": "重新连接",
+      "exitCode": "退出码 {{code}}",
+      "disabled": "终端不可用:可能在服务端被关掉(VIBE_UI_ENABLE_TERMINAL=0),或当前会话未获授权。",
+      "status": {
+        "connecting": "连接中…",
+        "ready": "已连接",
+        "closed": "会话已结束",
+        "disabled": "未开启",
+        "error": "已断开"
+      },
+      "keys": {
+        "esc": "Esc",
+        "tab": "Tab",
+        "ctrl": "Ctrl",
+        "up": "↑",
+        "down": "↓",
+        "left": "←",
+        "right": "→",
+        "interrupt": "^C",
+        "pipe": "|"
+      }
+    }
   },
   "appShell": {
     "title": "Avibe OS",

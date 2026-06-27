@@ -243,6 +243,10 @@
           "label": "Show Page runtime",
           "detail": "Renders visual Show Pages on your machine."
         },
+        "tmux": {
+          "label": "tmux",
+          "detail": "Persistent terminal runtime for reconnectable Web Terminal sessions."
+        },
         "node": {
           "label": "Node.js",
           "detail": "Shared prerequisite for the runtimes above."
@@ -591,6 +595,78 @@
     "cloudflared_exited": "The connector exited immediately after startup. This usually means the Tunnel credential is invalid or the Cloudflare config is not ready. Pair again and retry.",
     "cloudflared_stop_failed": "The connector could not be stopped. Try again later, or manually stop the cloudflared process.",
     "cloudflared_process_unknown": "Avibe found a connector-like process but could not verify ownership. To avoid killing the wrong process, it did not change it. Check the cloudflared process manually and retry."
+  },
+  "apps": {
+    "title": "Apps",
+    "soon": "Soon",
+    "fileBrowser": {
+      "label": "File Browser",
+      "desc": "Browse, view, and edit files on this machine.",
+      "placeholder": "The File Browser is being built. You'll be able to browse the whole machine, open files, and edit and save them right here.",
+      "tagline": "Whole machine · view and edit",
+      "selectHint": "Select a file to view or edit it.",
+      "empty": "This folder is empty.",
+      "noPreview": "No in-app preview for this file type.",
+      "download": "Download",
+      "tooLarge": "This file is too large to edit in the browser. Download it to view it instead.",
+      "refresh": "Refresh",
+      "newFolder": "New folder",
+      "newFolderPrompt": "New folder name",
+      "projects": "Projects",
+      "system": "System",
+      "showHidden": "Show hidden files",
+      "save": "Save",
+      "unsaved": "Unsaved changes",
+      "conflict": "This file changed on disk since you opened it. Reload before saving to avoid overwriting it.",
+      "listTruncated": "Only the first {{count}} entries are shown.",
+      "errors": {
+        "conflict": "This file changed on disk since you opened it. Reload before saving to avoid overwriting it.",
+        "not_found": "Path not found.",
+        "permission_denied": "Permission denied.",
+        "too_large": "This file is too large.",
+        "file_not_utf8": "This file isn't valid UTF-8 text, so it can't be edited safely — download it instead.",
+        "not_dir": "Path is not a folder.",
+        "not_file": "Path is not a regular file.",
+        "is_symlink": "Symbolic links cannot be edited here.",
+        "invalid_path": "Enter a valid absolute path.",
+        "invalid_name": "Enter a valid name.",
+        "exists": "Path already exists.",
+        "fs_error": "File system operation failed.",
+        "listFailed": "Couldn't list this folder.",
+        "openFailed": "Couldn't open this item.",
+        "createFolderFailed": "Couldn't create the folder.",
+        "loadFailed": "Couldn't load this file.",
+        "saveFailed": "Couldn't save this file."
+      }
+    },
+    "terminal": {
+      "label": "Terminal",
+      "desc": "A real shell in your browser.",
+      "placeholder": "The Terminal arrives in Phase 2: a real shell with tmux-backed persistent sessions.",
+      "tagline": "A real shell, in your browser.",
+      "persistent": "Persistent",
+      "reconnect": "Reconnect",
+      "exitCode": "exit {{code}}",
+      "disabled": "Terminal unavailable: it may be turned off on the server (VIBE_UI_ENABLE_TERMINAL=0) or this session isn't authorized.",
+      "status": {
+        "connecting": "Connecting…",
+        "ready": "Connected",
+        "closed": "Session ended",
+        "disabled": "Disabled",
+        "error": "Disconnected"
+      },
+      "keys": {
+        "esc": "Esc",
+        "tab": "Tab",
+        "ctrl": "Ctrl",
+        "up": "↑",
+        "down": "↓",
+        "left": "←",
+        "right": "→",
+        "interrupt": "^C",
+        "pipe": "|"
+      }
+    }
   },
   "appShell": {
     "title": "Avibe OS",

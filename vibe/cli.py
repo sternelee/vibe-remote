@@ -63,6 +63,8 @@ from storage.settings_service import make_scope_id
 
 logger = logging.getLogger(__name__)
 UV_TOOL_PACKAGE_NAMES = (PACKAGE_NAME, LEGACY_PACKAGE_NAME)
+_TRUTHY_ENV_VALUES = {"1", "true", "yes", "on"}
+_FALSY_ENV_VALUES = {"0", "false", "no", "off"}
 
 WATCH_STARTUP_STABLE_RUNNING_SECONDS = 1.5
 WATCH_STARTUP_JITTER_BUFFER_SECONDS = 1.0
@@ -6293,9 +6295,11 @@ def cmd_runtime(args) -> int:
         offline = True if getattr(args, "offline", False) else None
         payload = manager.prepare(force=getattr(args, "force", False), offline=offline)
         askill = _ensure_askill_during_prepare(offline=bool(offline))
+        tmux = _ensure_tmux_during_prepare(offline=bool(offline), force=getattr(args, "force", False))
         avault = _ensure_avault_during_prepare(offline=bool(offline))
         payload["askill"] = askill
         payload["avault"] = avault
+        payload["tmux"] = tmux
         if getattr(args, "json", False):
             print(json.dumps(payload, indent=2))
         else:
@@ -6319,6 +6323,12 @@ def cmd_runtime(args) -> int:
                 print("avault installed." if avault.get("changed") else "avault ready.")
             else:
                 print(f"avault not ready: {avault.get('message') or 'install failed'}", file=sys.stderr)
+            if tmux.get("skipped") or tmux.get("status") == "skipped":
+                print(f"tmux: skipped ({tmux.get('reason') or 'skipped'}).")
+            elif tmux.get("ok"):
+                print("tmux installed." if tmux.get("changed") else "tmux ready.")
+            else:
+                print(f"tmux not ready: {tmux.get('message') or tmux.get('reason') or 'install failed'}", file=sys.stderr)
         return 1 if getattr(args, "strict", False) and not payload.get("ok") else 0
     if command == "clean":
         payload = manager.clean(keep_previous=getattr(args, "keep_previous", 1))
@@ -6376,10 +6386,30 @@ def _ensure_askill_during_prepare(offline: bool = False) -> dict:
     """
     if offline:
         return {"ok": True, "skipped": True, "reason": "offline"}
-    if os.environ.get("VIBE_INSTALL_SKIP_ASKILL", "").strip().lower() in {"1", "true", "yes", "on"}:
+    if os.environ.get("VIBE_INSTALL_SKIP_ASKILL", "").strip().lower() in _TRUTHY_ENV_VALUES:
         return {"ok": True, "skipped": True, "reason": "VIBE_INSTALL_SKIP_ASKILL"}
     try:
         return api.ensure_askill_installed(force=True)
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "message": str(exc)}
+
+
+def _ensure_tmux_during_prepare(offline: bool = False, force: bool = False) -> dict:
+    """Ensure optional tmux alongside managed runtimes.
+
+    tmux powers persistent Web Terminal sessions, but absence must never block
+    prepare or upgrades: the terminal backend will fall back to ephemeral PTY.
+    """
+    if offline:
+        return {"ok": True, "skipped": True, "reason": "offline"}
+    if os.environ.get("VIBE_UI_ENABLE_TERMINAL", "").strip().lower() in _FALSY_ENV_VALUES:
+        return {"ok": True, "status": "skipped", "reason": "terminal_disabled"}
+    if os.environ.get("VIBE_INSTALL_SKIP_TMUX", "").strip().lower() in _TRUTHY_ENV_VALUES:
+        return {"ok": True, "skipped": True, "reason": "VIBE_INSTALL_SKIP_TMUX"}
+    try:
+        from core.tmux_runtime import ensure_tmux_installed
+
+        return ensure_tmux_installed(force=force)
     except Exception as exc:  # noqa: BLE001
         return {"ok": False, "message": str(exc)}
 
@@ -6388,7 +6418,7 @@ def _ensure_avault_during_prepare(offline: bool = False) -> dict:
     """Ensure avault (the Vault custody core) alongside other local deps."""
     if offline:
         return {"ok": True, "skipped": True, "reason": "offline"}
-    if os.environ.get("VIBE_INSTALL_SKIP_AVAULT", "").strip().lower() in {"1", "true", "yes", "on"}:
+    if os.environ.get("VIBE_INSTALL_SKIP_AVAULT", "").strip().lower() in _TRUTHY_ENV_VALUES:
         return {"ok": True, "skipped": True, "reason": "VIBE_INSTALL_SKIP_AVAULT"}
     try:
         return api.ensure_avault_installed(force=True)

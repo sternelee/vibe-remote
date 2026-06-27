@@ -3934,7 +3934,7 @@ def reconcile_askill_auto_update() -> dict:
 # Dependencies aggregate + manual install jobs (askill / show runtime)
 # =============================================================================
 
-_ALLOWED_DEP_INSTALLS = {"askill", "avault", "show-runtime"}
+_ALLOWED_DEP_INSTALLS = {"askill", "avault", "show-runtime", "tmux"}
 _STARTUP_DEPENDENCY_RECONCILE_LOCK = threading.Lock()
 _DEFAULT_STARTUP_SHOW_PAGE_PREWARM_LIMIT = 3
 _MAX_STARTUP_SHOW_PAGE_PREWARM_LIMIT = 10
@@ -3997,6 +3997,23 @@ def dependencies_status() -> dict:
         }
     )
 
+    try:
+        from core.tmux_runtime import tmux_status
+
+        tmux = tmux_status()
+    except Exception as exc:  # noqa: BLE001
+        tmux = {"installed": False, "version": None, "status": "missing", "reason": str(exc)}
+    deps.append(
+        {
+            "id": "tmux",
+            "kind": "tool",
+            "required": False,
+            "installed": bool(tmux.get("installed")),
+            "version": tmux.get("version"),
+            "status": "ready" if tmux.get("installed") else "missing",
+        }
+    )
+
     # Node present but below the Show Runtime minimum (node_supported is False)
     # is not actually usable — don't show it green while runtime repair fails.
     node_ok = bool(srt.get("node_available")) and srt.get("node_supported") is not False
@@ -4024,6 +4041,22 @@ def _prepare_show_runtime_job() -> dict:
             "ok": ok,
             "message": "Show Runtime ready." if ok else (payload.get("reason") or "Show Runtime prepare failed"),
             "output": None,
+        }
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "message": str(exc), "output": None}
+
+
+def _prepare_tmux_job() -> dict:
+    try:
+        from core.tmux_runtime import ensure_tmux_installed
+
+        payload = ensure_tmux_installed(force=True)
+        ok = bool(payload.get("ok"))
+        return {
+            **payload,
+            "ok": ok,
+            "message": "tmux runtime ready." if ok else (payload.get("message") or payload.get("reason") or "tmux install failed"),
+            "output": payload.get("output"),
         }
     except Exception as exc:  # noqa: BLE001
         return {"ok": False, "message": str(exc), "output": None}
@@ -4099,6 +4132,7 @@ def reconcile_startup_dependencies() -> dict:
         "askill": {"ok": False, "status": "unknown"},
         "avault": {"ok": False, "status": "unknown"},
         "show_runtime": {"ok": False, "status": "unknown"},
+        "tmux": {"ok": False, "status": "unknown"},
     }
     try:
         try:
@@ -4147,6 +4181,20 @@ def reconcile_startup_dependencies() -> dict:
         except Exception as exc:  # noqa: BLE001
             logger.warning("Startup dependency reconcile failed to prepare Show Runtime: %s", exc, exc_info=True)
             result["show_runtime"] = {"ok": False, "status": "failed", "reason": str(exc)}
+
+        if os.environ.get("VIBE_UI_ENABLE_TERMINAL", "").strip().lower() in {"0", "false", "no", "off"}:
+            # Terminal explicitly disabled — don't download the optional tmux runtime.
+            result["tmux"] = {"ok": True, "status": "skipped", "reason": "terminal_disabled"}
+        elif os.environ.get("VIBE_INSTALL_SKIP_TMUX", "").strip().lower() in _TRUTHY_ENV_VALUES:
+            result["tmux"] = {"ok": True, "skipped": True, "reason": "VIBE_INSTALL_SKIP_TMUX"}
+        else:
+            try:
+                from core.tmux_runtime import ensure_tmux_installed
+
+                result["tmux"] = ensure_tmux_installed(force=False)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Startup dependency reconcile failed to ensure tmux runtime: %s", exc, exc_info=True)
+                result["tmux"] = {"ok": False, "status": "failed", "reason": str(exc)}
 
         result["duration_ms"] = int((time.monotonic() - started_at) * 1000)
         result["ok"] = (
@@ -4198,8 +4246,12 @@ def start_dependency_install_job(dep: str) -> dict:
                 result = ensure_askill_installed(force=True)
             elif dep == "avault":
                 result = ensure_avault_installed(force=True)
-            else:
+            elif dep == "show-runtime":
                 result = _prepare_show_runtime_job()
+            elif dep == "tmux":
+                result = _prepare_tmux_job()
+            else:
+                result = {"ok": False, "message": f"Unknown dependency: {dep}", "output": None}
             ok = bool(result.get("ok"))
             with _AGENT_INSTALL_JOB_LOCK:
                 current = _AGENT_INSTALL_JOBS.get(job_id)
