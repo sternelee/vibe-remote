@@ -536,13 +536,34 @@ These are starting recommendations, not frozen choices — items #2 (envelope) a
 
 | Verb | Input | Output | Purpose |
 |---|---|---|---|
-| `pubkey` | — | X25519 public key + fingerprint | the browser fetches this before sealing a blind box (protected tier must pin / attest it) |
+| `pubkey` | — | X25519 public key + fingerprint | one-shot `pubkey` supports blind-box create; protected DEK release uses the resident agent's ephemeral `pubkey` frame |
 | `seal` | blind box (the value) + name/scheme | envelope `{ciphertext, nonce, wrap_meta}` | standard-tier create: open box → wrap DEK under master → return ciphertext (never plaintext) |
-| `deliver` | envelope + mode (`run` / `fetch` / `inject`) + *optional* DEK blind box | exit code / response body | decrypt and deliver. No DEK ⇒ standard tier (master key); with DEK ⇒ protected tier (browser-released DEK) |
-| `sign` | key envelope + digest/tx + *optional* DEK blind box | signature (public) | standard-tier signing (secp256k1); the private key never leaves `avault` |
+| `deliver` | envelope + mode (`run` / `fetch` / `inject`) | exit code / response body | one-shot standard-tier delivery uses the master key; protected delivery uses resident-agent grants, never inline DEK boxes |
+| `sign` | key envelope + digest/tx | signature (public) | one-shot standard-tier signing; protected signing uses resident-agent grants or browser-local signing |
 | `key export` / `key import` | passphrase (stdin) | encrypted backup / ok | back up, migrate, restore the master key |
 
 The resident agent (P2) adds `grant` / `release`: cache a scope's DEK-set for a TTL so repeated uses in-window skip re-unlock. Standard-tier signing of an ETH key is `sign`; protected-tier ETH signing happens entirely in the browser and never reaches this interface.
+
+### Blind-box AAD contract
+
+Browser blind boxes use HPKE Base mode with DHKEM-X25519-HKDF-SHA256, HKDF-SHA256, AES-256-GCM. The JSON scheme is `hpke-x25519-hkdfsha256-aes256gcm-v1`; HPKE `info` is `avault:blind-box:v1`. The HPKE AAD is operation-bound bytes:
+
+```text
+"avault:blind-box:aad:v1"
+  || field(purpose)
+  || field(name)
+  || field("machine-aesgcm-v1")
+  || field(0x01)
+  || field(scope_type or "")
+  || field(scope_ref or "")
+  || field(sign_scheme or "")
+  || field(digest or "")
+  || field(approval_nonce or "")
+  || field(approval_expires_at_unix_be or "")
+  || field(operation_hash or "")
+```
+
+`field(x)` is `uint32_be(len(x)) || x`; strings are UTF-8; signing digests and operation hashes are raw 32-byte values. Protected DEK blind boxes require approval metadata and are accepted only by the resident agent; one-shot CLI paths reject inline `dek_blindbox` / `approval` fields. Agent grants authenticate `scope_type` and `scope_ref` directly in AAD and bind the grant TTL in `operation_hash`: agent delivery uses `"agent-deliver"`, name, `ttl_secs_u64_be`; agent signing uses `"agent-sign"`, scheme, raw digest, `ttl_secs_u64_be`. The shared byte vectors live in `tests/vectors/p2_core_crypto.json` in the avault repo and are mirrored into the browser tests.
 
 ### Transport
 
