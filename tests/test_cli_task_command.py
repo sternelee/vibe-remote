@@ -182,7 +182,7 @@ def test_task_help_describes_session_id_guidance(capsys) -> None:
     assert exc.value.code == 0
     captured = capsys.readouterr()
     assert "Create, inspect, and control scheduled Agent messages for Avibe." in captured.out
-    assert "vibe task add --session-id sesk8m4q2p7x" in captured.out
+    assert "vibe task add --session-id sesk8m4q2p7x --cron '0 * * * *' --message" in captured.out
     assert "{add,update,list,show,pause,resume,run,remove}" in captured.out
     assert "rm (remove)" not in captured.out
     assert "\n    ls" not in captured.out
@@ -198,7 +198,8 @@ def test_task_add_help_includes_examples_and_threadless_guidance(capsys) -> None
     captured = capsys.readouterr()
     assert "If this is your first time using this command, read this whole help entry before creating a task." in captured.out
     assert "`--session-id` chooses which Agent Session Avibe will continue using when the task runs." in captured.out
-    assert "--post-to" in captured.out
+    assert "tasks continue this conversation by default" in captured.out
+    assert "--post-to" not in captured.out
     assert "--same-scope" in captured.out
     assert "--scope-id" in captured.out
     assert "--deliver-key" not in captured.out
@@ -217,11 +218,10 @@ def test_hook_send_help_describes_runtime_effects(capsys) -> None:
     assert "`vibe hook send` is a compatibility entrypoint." in captured.out
     assert "New automation should use `vibe agent run --async`." in captured.out
     assert "`vibe hook send` queues one deprecated asynchronous compatibility turn" in captured.out
-    assert "`--post-to channel` changes where the message is posted, not which session is continued." in captured.out
+    assert "--post-to" not in captured.out
     assert "`--message` and `--message-file` provide the one-shot async user message that will be queued immediately." in captured.out
     assert "--session-id" in captured.out
-    assert "vibe agent run --async --session-id sesk8m4q2p7x --no-callback" in captured.out
-    assert "--callback-session-id sescaller123" in captured.out
+    assert "vibe agent run --async --session-id sesk8m4q2p7x --no-callback --message" in captured.out
 
 
 def test_task_list_help_mentions_completed_one_shots_hidden_by_default(capsys) -> None:
@@ -261,7 +261,7 @@ def test_hook_send_help_includes_examples_and_threadless_guidance(capsys) -> Non
     assert exc.value.code == 0
     captured = capsys.readouterr()
     assert "`vibe hook send` queues one deprecated asynchronous compatibility turn" in captured.out
-    assert "--post-to" in captured.out
+    assert "--post-to" not in captured.out
     assert "--deliver-key" not in captured.out
     assert "--session-id" in captured.out
     assert "vibe agent run --async --session-id sesk8m4q2p7x --no-callback" in captured.out
@@ -280,10 +280,23 @@ def test_agent_run_help_includes_fork_session_guidance(capsys) -> None:
     assert "--same-scope" in captured.out
     assert "--scope-id" in captured.out
     assert "--deliver-key" not in captured.out
-    assert "--fork-self forks the current caller Session from AVIBE_SESSION_ID." in captured.out
+    assert "--fork-self forks this current Session." in captured.out
     assert "Forks keep the same backend, scope, and cwd as the source Session." in captured.out
     assert "vibe agent run --async --fork-self --message" in captured.out
-    assert "Do not combine fork flags with --session-id, --create-session, or --create-session-per-run." in captured.out
+    assert "vibe agent run --agent release-reviewer --message 'Review the latest deployment result.'" in captured.out
+    assert (
+        "vibe agent run --agent release-reviewer --same-scope --message 'Review this project in a visible sibling Session.'"
+        in captured.out
+    )
+    assert "vibe agent run --agent release-reviewer --no-callback --message" not in captured.out
+    assert "vibe agent run --agent release-reviewer --same-scope --no-callback --message" not in captured.out
+    assert "From an Avibe Agent shell, async runs return their final result to this conversation by default." in captured.out
+    assert "From a normal terminal, pass --callback-session-id or --no-callback for async runs." in captured.out
+    assert "Review the latest CI result and report back." in captured.out
+    assert "--callback-session-id sescaller456 --message 'Review the latest CI result and report back.'" in captured.out
+    assert "--no-callback --message 'Review the latest CI result and report back.'" not in captured.out
+    assert "Do not combine fork flags with --session-id or --create-session." in captured.out
+    assert "--create-session-per-run" not in captured.out
 
 
 def test_task_add_parse_error_is_structured_json(capsys) -> None:
@@ -763,7 +776,7 @@ def test_task_add_defaults_target_to_caller_session(tmp_path: Path, capsys) -> N
     assert payload["task"]["session_policy"] == "existing"
     assert payload["session_default_notice"] == {
         "code": "session_defaulted_to_caller",
-        "message": "Task target Session defaulted to the caller Session from AVIBE_SESSION_ID.",
+        "message": "Task target Session defaulted to this Agent Session.",
         "session_id": "sesCaller",
     }
 
