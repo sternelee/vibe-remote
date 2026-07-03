@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
-import { Check, Clock, Copy, Globe, History, Inbox, KeyRound, Layers, Link2, Loader2, Plus, Puzzle, RefreshCw, ShieldCheck, Tag, Trash2, Wallet, X } from 'lucide-react';
+import { Check, Clock, Copy, Globe, History, Inbox, KeyRound, Link2, Loader2, Plus, Puzzle, RefreshCw, ShieldCheck, Tag, Trash2, Wallet, X } from 'lucide-react';
 import type { TFunction } from 'i18next';
 import { useTranslation } from 'react-i18next';
 import { CapabilityTabs } from './CapabilityTabs';
@@ -163,8 +163,7 @@ function chipCountdown(rem: { h: number; m: number; s: number }): string {
  * (skills, tags, explicit env), so a mixed grant (e.g. same skill but a different `--tag`
  * or `--env`) stays distinguishable and revoke targets the right access. Returns a compact
  * `label` (truncated for the chip) and a `full` form (every token) for the tooltip and the
- * revoke confirmation. For a legacy pre-refactor grant (no source_selector) it falls back to
- * the scope ref / member names until the grant-id backend lands.
+ * revoke confirmation.
  */
 function describeGrant(g: VaultGrant, t: TFunction): { Icon: typeof KeyRound; label: string; full: string } {
   const compact = (tokens: string[]): string =>
@@ -179,11 +178,6 @@ function describeGrant(g: VaultGrant, t: TFunction): { Icon: typeof KeyRound; la
     const Icon = skills.length ? Puzzle : tags.length ? Tag : KeyRound;
     return { Icon, label: compact(tokens), full: tokens.join(', ') };
   }
-  // Legacy grant: no source_selector. Use the concrete scope ref / member names.
-  if (g.scope_ref) {
-    const Icon = g.scope_type === 'skill' ? Puzzle : g.scope_type === 'group' ? Layers : KeyRound;
-    return { Icon, label: g.scope_ref, full: g.scope_ref };
-  }
   const names = g.member_snapshot ?? [];
   if (names.length) return { Icon: KeyRound, label: compact(names), full: names.join(', ') };
   const count = t('vaults.grants.secretCount', { count: g.member_count || 0 });
@@ -194,7 +188,7 @@ function describeGrant(g: VaultGrant, t: TFunction): { Icon: typeof KeyRound; la
  * Active-grant chip (design.pen `y4rw5Q` ACTIVE GRANTS row): a compact mint pill describing
  * how the protected set was selected (explicit secrets, a tag, or a skill), a live countdown,
  * and an inline × to revoke. A grant is a fixed protected set keyed by grant_id — the chip
- * summarizes its `source_selector` (or the legacy scope during the bridge), never a group.
+ * summarizes its `source_selector`, never a group.
  */
 const GrantChip: React.FC<{ grant: VaultGrant; now: number; onRevoke: (grant: VaultGrant) => void }> = ({
   grant: g,

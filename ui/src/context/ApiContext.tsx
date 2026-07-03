@@ -97,12 +97,9 @@ export type VaultGrant = {
   member_snapshot: string[];
   member_count: number;
   runtime_member_count: number;
+  delivery_ready?: boolean;
+  delivery_status?: string;
   one_shot?: boolean;
-  /** Legacy pre-refactor bridge only: the current backend still returns scope_type/scope_ref
-   *  (no source_selector). Read to keep grant chips distinguishable until Track B lands; not
-   *  part of the final product shape and never written by the UI. */
-  scope_type?: string;
-  scope_ref?: string;
 };
 
 type VaultBlindBox = {
@@ -115,14 +112,9 @@ type VaultBlindBox = {
  * Browser-relayed protected access fulfillment. The browser releases each protected
  * DEK as an opaque HPKE blind box addressed to the resident avault agent and submits
  * ONLY `{name, dek_blindbox, approval}` per secret — never a raw DEK or plaintext.
- *
- * `scope_type`/`scope_ref` are NOT a product concept: they are the opaque binding the
- * DEK blind box is sealed against (blindBoxAgentDeliverOperationHash), relayed verbatim
- * pending the avault-side grant_id migration (Track A). The UI never shows them.
  */
 export type VaultAccessFulfillmentPayload = {
-  scope_type?: string;
-  scope_ref?: string;
+  grant_id?: string;
   session_id?: string | null;
   ttl_seconds?: number;
   this_session_only?: boolean;

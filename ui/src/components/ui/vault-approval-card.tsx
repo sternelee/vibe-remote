@@ -21,14 +21,10 @@ import { VaultProtectedUnlock } from './vault-protected-unlock';
 /**
  * The fixed protected grant the daemon attaches to an access request's card. In the
  * grant-id model there is exactly one: the protected set covered by the request's
- * selector. `scope_type`/`scope_ref` are NOT a product concept — they are the opaque
- * binding the DEK blind box is sealed against (blindBoxAgentDeliverOperationHash),
- * relayed verbatim to the resident avault agent pending the avault-side grant_id
- * migration (Track A). The UI never renders them.
+ * selector. `grant_id` is the avault runtime scope and the DEK blind-box AAD binding.
  */
 type GrantOption = {
-  scope_type?: string;
-  scope_ref?: string;
+  grant_id: string;
   default_ttl_seconds?: number;
   session_binding_default?: boolean;
   member_count?: number;
@@ -42,6 +38,8 @@ type ApprovalCard = {
   card_type?: string;
   request_type?: 'access' | 'sign';
   secret_name?: string;
+  secret_names?: string[];
+  protected_secret_names?: string[];
   kind?: string | null;
   protection?: string | null;
   command?: string | null;
@@ -51,9 +49,8 @@ type ApprovalCard = {
   /** How the protected set was selected: explicit env names vs tags/skills. */
   source_selector?: VaultSourceSelector;
   default_ttl_seconds?: number;
-  /** The fixed protected grant. New backend sends `grant_options`; older sends `scope_options`. */
+  /** The fixed protected grant. */
   grant_options?: GrantOption[];
-  scope_options?: GrantOption[];
   /** Hydrated for UI audience when the requested secret is protected. */
   secret_unlock_material?: ProtectedUnlockMaterial | null;
 };
@@ -115,26 +112,22 @@ export const VaultApprovalCard: React.FC<{
   const card = (request.card ?? null) as ApprovalCard | null;
   const delivery = (request.delivery ?? {}) as { digest?: string; scheme?: string };
   const isSign = (card?.request_type ?? request.request_type) === 'sign';
-  const isProtected = card?.protection === 'protected';
   const isKeypair = card?.kind === 'keypair';
 
   // A grant covers a fixed protected set — there is no scope picker.
-  const grantOptions = useMemo(() => card?.grant_options ?? card?.scope_options ?? [], [card]);
-  const option = useMemo(() => {
-    if (!grantOptions.length) return undefined;
-    // New backend: exactly one fixed protected set covered by the request's selector.
-    if (card?.grant_options?.length) return grantOptions[0];
-    // Legacy pre-refactor scope_options are ordered [secret, skill, group] and only options
-    // containing protected members get hydrated unlock_material. Prefer the EXACT
-    // requested-secret scope so approving never auto-selects a broader skill/group option that
-    // would release unrelated protected secrets; fall back to a protected option only if the
-    // secret scope is absent.
-    const exact = grantOptions.find((o) => o.scope_type === 'secret');
-    return exact ?? grantOptions.find((o) => (o.unlock_material?.length ?? 0) > 0) ?? grantOptions[0];
-  }, [grantOptions, card]);
+  const grantOptions = useMemo(() => card?.grant_options ?? [], [card]);
+  const option = useMemo(() => grantOptions[0], [grantOptions]);
   const materials = useMemo(() => option?.unlock_material ?? [], [option]);
+  const memberNames = useMemo(() => {
+    if (isSign) return card?.secret_name ? [card.secret_name] : [];
+    return option?.member_snapshot?.length ? option.member_snapshot : (card?.secret_names ?? (card?.secret_name ? [card.secret_name] : []));
+  }, [card, isSign, option]);
   // Protected secret names to be granted (design: "show the protected secret names covered").
-  const protectedNames = useMemo(() => materials.map((m) => m.name), [materials]);
+  const protectedNames = useMemo(() => {
+    const materialNames = materials.map((m) => m.name);
+    return materialNames.length ? materialNames : (card?.protected_secret_names ?? []);
+  }, [card, materials]);
+  const isProtected = isSign ? card?.protection === 'protected' : protectedNames.length > 0 || card?.protection === 'protected';
   const source = useMemo<VaultSourceSelector>(() => card?.source_selector ?? option?.source_selector ?? {}, [card, option]);
   const sourceChips = useMemo(() => {
     const chips: Array<{ key: string; label: string; icon: typeof KeyRound; mono?: boolean }> = [];
@@ -153,7 +146,7 @@ export const VaultApprovalCard: React.FC<{
 
   // A request needs the browser VMK unlocked when it touches protected key material:
   // a protected sign, or an access whose fixed set includes protected members.
-  const needsUnlock = isSign ? isProtected : materials.length > 0;
+  const needsUnlock = isSign ? isProtected : protectedNames.length > 0;
   const unlocked = vault.status === 'unlocked';
 
   useEffect(() => {
@@ -180,21 +173,18 @@ export const VaultApprovalCard: React.FC<{
   const approveAccess = () =>
     finish(async () => {
       if (!option) throw new Error(t('vaults.approval.errors.noScope'));
+      const grantId = option.grant_id?.trim();
+      if (!grantId) throw new Error(t('vaults.approval.errors.failed'));
       // A protected secret with no hydrated unlock material means the request was read
       // without UI-audience hydration — fail clearly instead of taking the standard path
       // (which the daemon rejects for a protected secret anyway).
       if (isProtected && materials.length === 0) throw new Error(t('vaults.approval.errors.missingMaterial'));
-      // `scope_type`/`scope_ref` are the opaque binding the DEK blind box is sealed against
-      // and relayed with; the backend supplies them (grant_id bridge). Never shown to the user.
-      const bindScopeType = option.scope_type ?? '';
-      const bindScopeRef = option.scope_ref ?? '';
       if (materials.length === 0) {
         // No protected members (a hidden always-ask standard case) — metadata-only grant, no DEK.
         failIfNotOk(
           await api.createVaultGrant({
             request_id: request.id,
-            scope_type: bindScopeType,
-            scope_ref: bindScopeRef,
+            grant_id: grantId,
             ttl_seconds: ttlSeconds,
             this_session_only: thisSessionOnly,
           }),
@@ -210,8 +200,8 @@ export const VaultApprovalCard: React.FC<{
           const approvalNonce = crypto.getRandomValues(new Uint8Array(16));
           const context = await protectedDekReleaseBlindBoxContext(material.name, {
             kind: 'agent-deliver',
-            scopeType: bindScopeType,
-            scopeRef: bindScopeRef,
+            scopeType: 'grant',
+            scopeRef: grantId,
             ttlSecs: ttlSeconds,
             approval: { nonce: approvalNonce, expiresAtUnix },
             operationHash: await blindBoxAgentDeliverOperationHash(material.name, ttlSeconds),
@@ -227,8 +217,7 @@ export const VaultApprovalCard: React.FC<{
         }
         failIfNotOk(
           await api.fulfillVaultAccessRequest(request.id, {
-            scope_type: bindScopeType,
-            scope_ref: bindScopeRef,
+            grant_id: grantId,
             ttl_seconds: ttlSeconds,
             this_session_only: thisSessionOnly,
             agent_pubkey: agentPubkey,
@@ -313,7 +302,15 @@ export const VaultApprovalCard: React.FC<{
       {/* Details — borderless list, sentence-case labels. */}
       <div className="flex flex-col gap-3.5">
         <DetailRow label={isSign ? t('vaults.approval.key') : t('vaults.approval.secret')}>
-          <span className="truncate font-mono text-[13px] font-semibold">{card.secret_name}</span>
+          {memberNames.length > 1 ? (
+            memberNames.map((name) => (
+              <Badge key={name} variant="outline" className="font-mono">
+                {name}
+              </Badge>
+            ))
+          ) : (
+            <span className="truncate font-mono text-[13px] font-semibold">{memberNames[0] ?? card?.secret_name ?? ''}</span>
+          )}
           {isProtected ? (
             <Badge variant="warning">{t('vaults.protected')}</Badge>
           ) : (

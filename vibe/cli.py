@@ -4719,7 +4719,7 @@ def cmd_vault_list(args):
     try:
         engine = _open_vault_engine()
         with engine.connect() as conn:
-            secrets = vault_service.list_secrets(conn, group=getattr(args, "group", None))
+            secrets = vault_service.list_secrets(conn, tag=getattr(args, "tag", None))
         _print_cli_payload("vault_secrets", secrets=secrets)
         return 0
     except Exception as exc:
@@ -4733,7 +4733,7 @@ def cmd_vault_discover(args):
     try:
         engine = _open_vault_engine()
         with engine.connect() as conn:
-            secrets = vault_service.list_secrets(conn, group=getattr(args, "group", None))
+            secrets = vault_service.list_secrets(conn, tag=getattr(args, "tag", None))
         kind = (getattr(args, "kind", None) or "").strip()
         if kind:
             secrets = [secret for secret in secrets if secret.get("kind") == kind]
@@ -4825,6 +4825,7 @@ def _expire_agent_grant_after_missing(
     *,
     requester: dict | None = None,
     delivery: dict | None = None,
+    purpose: str = "run",
 ) -> dict | None:
     from storage import vault_service
 
@@ -4838,6 +4839,7 @@ def _expire_agent_grant_after_missing(
                     name,
                     requester=requester or {"source": "cli", "pid": os.getpid()},
                     delivery=delivery or {},
+                    purpose=purpose,
                 )
                 if first_request is None and isinstance(resolved.get("request"), dict):
                     first_request = resolved["request"]
@@ -5261,12 +5263,14 @@ def _resolve_vault_run_delivery(engine, mapping: dict[str, str], command_argv: l
 
     requester, delivery, session_id = _vault_cli_delivery_context(args, mode="run", command=command_argv)
     metas = _preflight_vault_run_batch(engine, mapping)
-    if metas and {str(meta.get("protection") or "standard") for meta in metas.values()} == {"protected"}:
+    tiers = {str(meta.get("protection") or "standard") for meta in metas.values()}
+    if metas and tiers == {"protected"}:
         with engine.begin() as conn:
             common_grant = vault_service.find_active_grant_for_secrets(
                 conn,
                 list(mapping.values()),
                 session_id=session_id,
+                purpose="run",
                 reserve_one_shot=True,
             )
             if common_grant is not None:
@@ -5274,6 +5278,21 @@ def _resolve_vault_run_delivery(engine, mapping: dict[str, str], command_argv: l
                     {"name": vault_name, "env": env_name, "envelope": vault_service.get_protected_envelope(conn, vault_name)}
                     for env_name, vault_name in mapping.items()
                 ]
+    if metas and tiers == {"standard"}:
+        with engine.begin() as conn:
+            standard_secrets = [
+                {"name": vault_name, "env": env_name, "envelope": vault_service.get_envelope(conn, vault_name)}
+                for env_name, vault_name in mapping.items()
+            ]
+            common_grant = vault_service.find_active_grant_for_secrets(
+                conn,
+                list(mapping.values()),
+                session_id=session_id,
+                purpose="run",
+                reserve_one_shot=True,
+            )
+            if isinstance(common_grant, dict) and common_grant.get("one_shot") is True:
+                return None, [common_grant], standard_secrets
     secrets = []
     grant: dict | None = None
     one_shot_grants: list[dict] = []
@@ -5288,6 +5307,7 @@ def _resolve_vault_run_delivery(engine, mapping: dict[str, str], command_argv: l
                     resolved = vault_service.resolve_secret_access(
                         conn,
                         vault_name,
+                        purpose="run",
                         requester=requester,
                         delivery=delivery,
                         reserve_one_shot=True,
@@ -5311,7 +5331,7 @@ def _resolve_vault_run_delivery(engine, mapping: dict[str, str], command_argv: l
                     current_grant = resolved["grant"]
                     if grant is None:
                         grant = current_grant
-                    elif grant["scope_type"] != current_grant["scope_type"] or grant["scope_ref"] != current_grant["scope_ref"]:
+                    elif grant["id"] != current_grant["id"]:
                         if current_grant.get("one_shot") is True:
                             one_shot_grants.append(current_grant)
                         pre_delivery_error = _mixed_grants_error(
@@ -5349,6 +5369,7 @@ def _resolve_single_vault_delivery(
     *,
     requester: dict,
     delivery: dict,
+    purpose: str = "run",
 ) -> tuple[dict | None, dict | None, object]:
     from storage import vault_service
 
@@ -5356,6 +5377,7 @@ def _resolve_single_vault_delivery(
         resolved = vault_service.resolve_secret_access(
             conn,
             name,
+            purpose=purpose,
             requester=requester,
             delivery=delivery,
             reserve_one_shot=True,
@@ -5381,12 +5403,14 @@ def _resolve_vault_inject_delivery(engine, names: list[str], *, path: str, fmt: 
 
     requester, delivery, session_id = _vault_cli_delivery_context(args, mode="inject", path=path, format=fmt)
     metas = _preflight_vault_inject_batch(engine, names)
-    if metas and {str(meta.get("protection") or "standard") for meta in metas.values()} == {"protected"}:
+    tiers = {str(meta.get("protection") or "standard") for meta in metas.values()}
+    if metas and tiers == {"protected"}:
         with engine.begin() as conn:
             common_grant = vault_service.find_active_grant_for_secrets(
                 conn,
                 names,
                 session_id=session_id,
+                purpose="inject",
                 reserve_one_shot=True,
             )
             if common_grant is not None:
@@ -5394,6 +5418,21 @@ def _resolve_vault_inject_delivery(engine, names: list[str], *, path: str, fmt: 
                     {"name": name, "key": name, "envelope": vault_service.get_protected_envelope(conn, name)}
                     for name in names
                 ]
+    if metas and tiers == {"standard"}:
+        with engine.begin() as conn:
+            standard_secrets = [
+                {"name": name, "key": name, "envelope": vault_service.get_envelope(conn, name)}
+                for name in names
+            ]
+            common_grant = vault_service.find_active_grant_for_secrets(
+                conn,
+                names,
+                session_id=session_id,
+                purpose="inject",
+                reserve_one_shot=True,
+            )
+            if isinstance(common_grant, dict) and common_grant.get("one_shot") is True:
+                return None, [common_grant], standard_secrets
     secrets = []
     grant: dict | None = None
     one_shot_grants: list[dict] = []
@@ -5408,6 +5447,7 @@ def _resolve_vault_inject_delivery(engine, names: list[str], *, path: str, fmt: 
                     resolved = vault_service.resolve_secret_access(
                         conn,
                         name,
+                        purpose="inject",
                         requester=requester,
                         delivery=delivery,
                         reserve_one_shot=True,
@@ -5431,7 +5471,7 @@ def _resolve_vault_inject_delivery(engine, names: list[str], *, path: str, fmt: 
                     current_grant = resolved["grant"]
                     if grant is None:
                         grant = current_grant
-                    elif grant["scope_type"] != current_grant["scope_type"] or grant["scope_ref"] != current_grant["scope_ref"]:
+                    elif grant["id"] != current_grant["id"]:
                         if current_grant.get("one_shot") is True:
                             one_shot_grants.append(current_grant)
                         pre_delivery_error = _mixed_grants_error(
@@ -5525,8 +5565,7 @@ def cmd_vault_run(args):
             ) as output_bridge:
                 handoff_started = True
                 result = api.avault_agent_deliver_run(
-                    scope_type=grant["scope_type"],
-                    scope_ref=grant["scope_ref"],
+                    grant_id=grant["id"],
                     secrets=secrets,
                     command=_agent_run_command(
                         command_argv,
@@ -5559,6 +5598,7 @@ def cmd_vault_run(args):
                 sorted(set(mapping.values())),
                 requester=requester,
                 delivery=delivery,
+                purpose="run",
             )
             _print_task_error(TaskCliError("protected grant expired; approve the request again", code="approval_required", help_command=help_command))
             return 1
@@ -5822,7 +5862,7 @@ def _vault_request_pending_message(name: str, request: dict[str, object], *, has
         return (
             f"Recorded a request for '{name}'. The user fulfills request {request['id']} from the Vaults page pending "
             f"requests list by opening its Provide secret row; that request-specific form preserves the requested "
-            f"group, policy, and skill links. Then use: vibe vault run --env {name} -- <command>"
+            f"tags, policy, and skill links. Then use: vibe vault run --env {name} -- <command>"
         )
     return (
         f"Recorded a request for '{name}'. The user fulfills it from the Vaults page pending requests list "
@@ -6051,12 +6091,12 @@ def cmd_vault_fetch(args):
             name,
             requester=requester,
             delivery=delivery,
+            purpose="fetch",
         )
         handoff_started = True
         if grant is not None:
             result = api.avault_agent_deliver_fetch(
-                scope_type=grant["scope_type"],
-                scope_ref=grant["scope_ref"],
+                grant_id=grant["id"],
                 name=name,
                 sealed=sealed,
                 request=request,
@@ -6112,6 +6152,7 @@ def cmd_vault_fetch(args):
                     [name],
                     requester=requester,
                     delivery=delivery,
+                    purpose="fetch",
                 )
                 _print_task_error(TaskCliError("protected grant expired; approve the request again", code="approval_required", help_command=help_command))
                 return 1
@@ -6226,8 +6267,7 @@ def cmd_vault_inject(args):
         handoff_started = True
         if grant is not None:
             api.avault_agent_deliver_inject(
-                scope_type=grant["scope_type"],
-                scope_ref=grant["scope_ref"],
+                grant_id=grant["id"],
                 path=resolved_out,
                 fmt=fmt,
                 secrets=secrets,
@@ -6275,6 +6315,7 @@ def cmd_vault_inject(args):
                 keys,
                 requester=requester,
                 delivery=delivery,
+                purpose="inject",
             )
             _print_task_error(TaskCliError("protected grant expired; approve the request again", code="approval_required", help_command=help_command))
             return 1
@@ -9680,7 +9721,7 @@ def build_parser():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         error_help_command="vibe vault list --help",
     )
-    vault_list_parser.add_argument("--group", help="Only list secrets in this group")
+    vault_list_parser.add_argument("--tag", help="Only list secrets with this tag")
     _add_json_noop(vault_list_parser)
 
     vault_discover_parser = vault_subparsers.add_parser(
@@ -9690,7 +9731,7 @@ def build_parser():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         error_help_command="vibe vault discover --help",
     )
-    vault_discover_parser.add_argument("--group", help="Only list secrets in this group")
+    vault_discover_parser.add_argument("--tag", help="Only list secrets with this tag")
     vault_discover_parser.add_argument("--kind", choices=["static", "keypair"], help="Only show this secret kind")
     vault_discover_parser.add_argument("--protection", choices=["standard", "protected"], help="Only show this protection tier")
     _add_json_noop(vault_discover_parser)
