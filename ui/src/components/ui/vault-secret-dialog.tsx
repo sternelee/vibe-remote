@@ -23,8 +23,10 @@ export const VaultSecretDialog: React.FC<{
   request?: VaultRequest | null;
   /** Rendered in place of the form (loading / ambiguous-provision notices from callers). */
   notice?: React.ReactNode;
+  onCancel?: () => void;
+  cancelLabel?: string;
   onCreated: (name: string, reason?: 'created' | 'already_exists') => void;
-}> = ({ open, onOpenChange, name, request, notice, onCreated }) => {
+}> = ({ open, onOpenChange, name, request, notice, onCancel, cancelLabel, onCreated }) => {
   const { t } = useTranslation();
   const card = (request?.card ?? null) as { default_protection?: unknown; spec?: VaultRequestSpec } | null;
   const requestSpec = (card?.spec ?? null) as VaultRequestSpec | null;
@@ -55,7 +57,8 @@ export const VaultSecretDialog: React.FC<{
             provisionRequestId={request?.id ?? null}
             requestSpec={requestSpec}
             defaultProtection={defaultProtection}
-            onCancel={() => onOpenChange(false)}
+            onCancel={onCancel ?? (() => onOpenChange(false))}
+            cancelLabel={cancelLabel}
             onCreated={onCreated}
             treatExistingAsFulfilled={isProvide}
           />
