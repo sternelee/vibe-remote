@@ -278,6 +278,30 @@ def test_get_provision_request_by_name_returns_pending_spec():
     assert result["ambiguous"] is False
 
 
+def test_provision_request_card_carries_session_id():
+    # The chat surface scopes request cards by card.session_id; provision must set it from the
+    # requester like access/sign do, or its card is invisible in the originating chat.
+    with api._vault_engine().begin() as conn:
+        req = vault_service.create_provision_request(
+            conn,
+            "DEPLOY_TOKEN",
+            requester={"source": "agent-cli", "session_id": "ses_abc123"},
+        )
+    assert req["card"]["session_id"] == "ses_abc123"
+    result = api.get_vault_provision_request_by_name("DEPLOY_TOKEN")
+    assert (result["request"]["card"] or {}).get("session_id") == "ses_abc123"
+
+
+def test_list_requests_scopes_by_session():
+    # A session-scoped query returns only that session's requests (filtered before the limit).
+    with api._vault_engine().begin() as conn:
+        vault_service.create_provision_request(conn, "TOK_A", requester={"source": "cli", "session_id": "ses_A"})
+        vault_service.create_provision_request(conn, "TOK_B", requester={"source": "cli", "session_id": "ses_B"})
+    scoped = api.get_vault_requests(session="ses_A")
+    assert {r["secret_name"] for r in scoped["requests"]} == {"TOK_A"}
+    assert {r["secret_name"] for r in api.get_vault_requests()["requests"]} >= {"TOK_A", "TOK_B"}
+
+
 def test_get_provision_request_returns_request_id_match():
     with api._vault_engine().begin() as conn:
         old_req = vault_service.create_provision_request(

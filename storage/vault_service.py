@@ -1495,7 +1495,8 @@ def create_provision_request(
         raise SecretNameCaseConflictError(name, pending_name)
     status = "fulfilled" if already else "pending"
     normalized_spec = normalize_provision_spec(spec)
-    card = _secure_input_card(name, request_id=request_id, reason=reason, spec=normalized_spec)
+    session_id = requester.get("session_id") if isinstance(requester, dict) else None
+    card = _secure_input_card(name, request_id=request_id, reason=reason, spec=normalized_spec, session_id=session_id)
     delivery_payload: dict[str, Any] = {"card": card}
     if reason:
         delivery_payload["reason"] = reason
@@ -1557,12 +1558,16 @@ def _secure_input_card(
     request_id: str,
     reason: str | None = None,
     spec: dict[str, Any] | None = None,
+    session_id: str | None = None,
 ) -> dict[str, Any]:
     normalized_spec = normalize_provision_spec(spec)
     card = {
         "card_type": "secure_input",
         "request_id": request_id,
         "secret_name": name,
+        # Carry the requesting session so surfaces can scope the card to its chat
+        # (mirrors approval_card); the Vaults page ignores it.
+        "session_id": session_id,
         "reason": reason,
         "protection_options": ["standard", "protected"],
         "default_protection": normalized_spec.get("protection") or "protected",
@@ -2160,17 +2165,22 @@ def list_requests(
     status: str | None = "pending",
     request_type: str | None = None,
     limit: int = 100,
+    session: str | None = None,
 ) -> list[dict[str, Any]]:
     _expire_pending_requests(conn)
-    query = select(vault_requests).order_by(vault_requests.c.created_at.desc(), vault_requests.c.id.desc()).limit(limit)
+    query = select(vault_requests).order_by(vault_requests.c.created_at.desc(), vault_requests.c.id.desc())
     if status is not None:
         query = query.where(vault_requests.c.status == status)
     if request_type is not None:
         query = query.where(vault_requests.c.request_type == request_type)
-    return [
-        _request_row_payload(dict(row), conn=conn, audience=REQUEST_AUDIENCE_UI)
-        for row in conn.execute(query).mappings()
-    ]
+    # session_id lives in the request JSON (not a column), so a session-scoped query must filter
+    # in Python BEFORE limiting — else a global page could truncate this session's older rows.
+    if session is None:
+        query = query.limit(limit)
+    rows = [dict(row) for row in conn.execute(query).mappings()]
+    if session is not None:
+        rows = [row for row in rows if _request_session_id(row) == session][:limit]
+    return [_request_row_payload(row, conn=conn, audience=REQUEST_AUDIENCE_UI) for row in rows]
 
 
 def resolve_pending_provision_request_by_name(conn: Connection, name: str) -> tuple[dict[str, Any] | None, bool]:
