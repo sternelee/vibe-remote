@@ -15,6 +15,13 @@ ENTRYPOINT = REPO_ROOT / "scripts" / "docker-entrypoint.sh"
 
 
 class DockerEntrypointSupervisorTests(unittest.TestCase):
+    def test_ui_process_uses_bounded_log_sinks(self):
+        entrypoint = ENTRYPOINT.read_text(encoding="utf-8")
+
+        self.assertIn('python -m vibe.log_sink "$ui_stdout"', entrypoint)
+        self.assertIn('python -m vibe.log_sink "$ui_stderr"', entrypoint)
+        subprocess.run(["bash", "-n", str(ENTRYPOINT)], check=True)
+
     def test_full_mode_exits_when_service_process_dies(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp_path = Path(tmpdir)
@@ -31,6 +38,10 @@ class DockerEntrypointSupervisorTests(unittest.TestCase):
                     args = sys.argv[1:]
                     if args and args[0] == "main.py":
                         sys.exit(42)
+
+                    if len(args) >= 2 and args[:2] == ["-m", "vibe.log_sink"]:
+                        sys.stdin.buffer.read()
+                        sys.exit(0)
 
                     if len(args) >= 2 and args[0] == "-c":
                         code = args[1]

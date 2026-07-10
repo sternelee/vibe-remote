@@ -5,9 +5,11 @@ import os
 import signal
 import sys
 import logging
+from logging.handlers import RotatingFileHandler
 from typing import Any
 
 from config.paths import ensure_data_dirs, get_logs_dir
+from vibe.logging_config import APPLICATION_LOG_BACKUP_COUNT, APPLICATION_LOG_MAX_BYTES
 from vibe.runtime import (
     ServiceAlreadyRunningError,
     acquire_service_instance_lock,
@@ -18,7 +20,13 @@ from vibe.runtime import (
 
 
 def _build_logging_handlers(logs_dir: str) -> list[logging.Handler]:
-    handlers: list[logging.Handler] = [logging.FileHandler(f"{logs_dir}/vibe_remote.log")]
+    handlers: list[logging.Handler] = [
+        RotatingFileHandler(
+            f"{logs_dir}/vibe_remote.log",
+            maxBytes=APPLICATION_LOG_MAX_BYTES,
+            backupCount=APPLICATION_LOG_BACKUP_COUNT,
+        )
+    ]
     if os.environ.get("VIBE_DISABLE_STDOUT_LOGGING", "").lower() not in {"1", "true", "yes"}:
         handlers.insert(0, logging.StreamHandler(sys.stdout))
     return handlers
