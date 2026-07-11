@@ -32,6 +32,7 @@ import { useWorkbenchInbox } from '../../context/WorkbenchInboxContext';
 import { useWorkbenchProjectsTree } from '../../context/WorkbenchProjectsContext';
 import { useWindowManager } from '../../context/WindowManagerContext';
 import { useComposerInsertTarget } from '../../context/ComposerBridgeContext';
+import { useUnsavedChangesActionGuard } from '../../context/useUnsavedChangesActionGuard';
 import type { InboxSession, WorkbenchProject, WorkbenchSession } from '../../context/ApiContext';
 import { formatRelativeTime } from '../../lib/relativeTime';
 import { Popover, PopoverAnchor, PopoverContent, PopoverTrigger } from '../ui/popover';
@@ -203,13 +204,13 @@ const STATUS_DOT_CLASS: Record<string, string> = {
 const SessionRow: React.FC<{
   session: WorkbenchSession;
   unread: number;
-  onSessionMarkRead: (sessionId: string) => void;
   onForkSession: (sessionId: string) => Promise<WorkbenchSession | null>;
   onRenameSession: (sessionId: string, title: string) => Promise<void>;
   onArchiveSession: (sessionId: string) => Promise<void>;
-}> = ({ session, unread, onSessionMarkRead, onForkSession, onRenameSession, onArchiveSession }) => {
+}> = ({ session, unread, onForkSession, onRenameSession, onArchiveSession }) => {
   const { t } = useTranslation();
   const navigate = useNavigate();
+  const authorizeRouteAction = useUnsavedChangesActionGuard();
   const location = useLocation();
   const active = location.pathname === `/chat/${session.id}`;
   // "Reference this session" shows only when a chat composer is mounted (a chat
@@ -283,10 +284,7 @@ const SessionRow: React.FC<{
       <PopoverAnchor asChild>
         <button
           type="button"
-          onClick={() => {
-            navigate(`/chat/${encodeURIComponent(session.id)}`);
-            if (unread > 0) onSessionMarkRead(session.id);
-          }}
+          onClick={() => navigate(`/chat/${encodeURIComponent(session.id)}`)}
           onContextMenu={(e) => {
             e.preventDefault();
             setMenuOpen(true);
@@ -340,11 +338,15 @@ const SessionRow: React.FC<{
           title={!session.native_session_id ? t('workbench.sessionForkUnavailable') : undefined}
           onClick={async () => {
             if (!canFork) return;
+            const authorization = authorizeRouteAction();
+            if (!authorization) return;
             setMenuOpen(false);
             setForking(true);
             try {
               const forked = await onForkSession(session.id);
-              if (forked) navigate(`/chat/${encodeURIComponent(forked.id)}`);
+              if (forked) {
+                authorization.runNavigation(() => navigate(`/chat/${encodeURIComponent(forked.id)}`));
+              }
             } finally {
               setForking(false);
             }
@@ -412,7 +414,6 @@ const ProjectRow: React.FC<{
   onCreateSession: () => void;
   creatingSession: boolean;
   unreadBySession: Record<string, number>;
-  onSessionMarkRead: (sessionId: string) => void;
   onRename: (next: string) => Promise<void>;
   onArchive: () => Promise<void>;
   onForkSession: (sessionId: string) => Promise<WorkbenchSession | null>;
@@ -430,7 +431,6 @@ const ProjectRow: React.FC<{
   onCreateSession,
   creatingSession,
   unreadBySession,
-  onSessionMarkRead,
   onRename,
   onArchive,
   onForkSession,
@@ -629,7 +629,6 @@ const ProjectRow: React.FC<{
                 key={session.id}
                 session={session}
                 unread={unreadBySession[session.id] || 0}
-                onSessionMarkRead={onSessionMarkRead}
                 onForkSession={onForkSession}
                 onRenameSession={onRenameSession}
                 onArchiveSession={onArchiveSession}
@@ -666,6 +665,7 @@ const ProjectRow: React.FC<{
 export const WorkbenchSidebar: React.FC<{ onOpenSearch?: () => void }> = ({ onOpenSearch }) => {
   const { t } = useTranslation();
   const navigate = useNavigate();
+  const authorizeRouteAction = useUnsavedChangesActionGuard();
   const { totalUnread, unreadSessions, inboxSessions, markRead, unreadBySession } = useWorkbenchInbox();
   // Projects/sessions tree — shared with the mobile ProjectsPage via the provider
   // (one EventSource + one cache, not a per-component reimplementation). The
@@ -737,7 +737,6 @@ export const WorkbenchSidebar: React.FC<{ onOpenSearch?: () => void }> = ({ onOp
   const onItemClick = (session: InboxSession) => {
     setPopoverOpen(false);
     navigate(`/chat/${encodeURIComponent(session.session_id)}`);
-    if ((unreadBySession[session.session_id] ?? 0) > 0) markRead(session.session_id);
   };
 
   const onMarkAllRead = async () => {
@@ -911,14 +910,17 @@ export const WorkbenchSidebar: React.FC<{ onOpenSearch?: () => void }> = ({ onOp
                   onLoadMore={() => loadMore(project.id)}
                   onToggle={() => toggleExpanded(project.id)}
                   onCreateSession={async () => {
+                    const authorization = authorizeRouteAction();
+                    if (!authorization) return;
                     // The provider creates + caches; navigation stays here since
                     // it's mounted above the router.
                     const session = await createSessionForProject(project.id);
-                    if (session) navigate(`/chat/${encodeURIComponent(session.id)}`);
+                    if (session) {
+                      authorization.runNavigation(() => navigate(`/chat/${encodeURIComponent(session.id)}`));
+                    }
                   }}
                   creatingSession={creatingSession(project.id)}
                   unreadBySession={unreadBySession}
-                  onSessionMarkRead={markRead}
                   onRename={(next) => renameProject(project.id, next)}
                   onArchive={() => archiveProject(project.id)}
                   onForkSession={(sessionId) => forkSession(project.id, sessionId)}
