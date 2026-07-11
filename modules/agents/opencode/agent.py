@@ -69,7 +69,17 @@ class OpenCodeAgent(OpenCodeMessageProcessorMixin, BaseAgent):
     async def _get_server(self) -> OpenCodeServerManager:
         return await self._client_manager.get_server()
 
-    async def refresh_runtime_config(self, opencode_config) -> None:
+    async def prepare_runtime_restart(self) -> None:
+        """Adopt persisted server state before the shared drain snapshot."""
+        await self._get_server()
+
+    def runtime_has_active_turns(self) -> bool:
+        if any(not task.done() for task in self._active_requests.values()):
+            return True
+        server = self._client_manager._server_manager
+        return bool(server is not None and server.runtime_has_active_turns())
+
+    async def refresh_runtime_config(self, opencode_config, *, force: bool = False) -> None:
         """Reload runtime config and refresh the shared server.
 
         OpenCode caches opencode.json provider/model config in the serve
@@ -78,7 +88,6 @@ class OpenCodeAgent(OpenCodeMessageProcessorMixin, BaseAgent):
         processes; fall back to restart for older OpenCode versions.
         """
         previous_server = await self._client_manager.reset_config(opencode_config)
-        adopted_uncached_server = False
         if previous_server is None:
             previous_server = await OpenCodeServerManager.get_instance_if_managed_server_exists(
                 binary=self.opencode_config.binary,
@@ -86,7 +95,6 @@ class OpenCodeAgent(OpenCodeMessageProcessorMixin, BaseAgent):
                 request_timeout_seconds=self.opencode_config.request_timeout_seconds,
                 resource_governor=governor_from_controller(self.controller),
             )
-            adopted_uncached_server = previous_server is not None
         self.opencode_config = opencode_config
         self.controller.config.opencode = opencode_config
         if previous_server is not None:
@@ -97,20 +105,24 @@ class OpenCodeAgent(OpenCodeMessageProcessorMixin, BaseAgent):
                 and previous_server.request_timeout_seconds == opencode_config.request_timeout_seconds
             )
             refresh_global_config = getattr(previous_server, "refresh_global_config", None)
-            if runtime_unchanged and callable(refresh_global_config):
+            if not force and runtime_unchanged and callable(refresh_global_config):
                 try:
                     refreshed = bool(await refresh_global_config())
                 except Exception:
                     logger.warning("OpenCode global config refresh failed; falling back to restart", exc_info=True)
                     refreshed = False
             if not refreshed:
-                if adopted_uncached_server and runtime_unchanged:
-                    return
                 detach = getattr(previous_server, "detach_after_deferred_refresh", None)
                 if callable(detach):
-                    await detach()
+                    if force:
+                        await detach(force=True)
+                    else:
+                        await detach()
                 elif hasattr(previous_server, "restart_for_auth_refresh"):
-                    await previous_server.restart_for_auth_refresh()
+                    if force:
+                        await previous_server.restart_for_auth_refresh(force=True)
+                    else:
+                        await previous_server.restart_for_auth_refresh()
             reload_config = getattr(previous_server, "reload_runtime_config", None)
             if callable(reload_config):
                 await reload_config(

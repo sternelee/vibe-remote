@@ -4,6 +4,8 @@ import asyncio
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
+import pytest
+
 from modules.agents.service import AgentService
 
 
@@ -244,6 +246,127 @@ def test_agent_service_serializes_same_runtime_until_terminal_release() -> None:
         await asyncio.wait_for(second, timeout=3)
 
         assert agent.started == ["first", "second"]
+
+    asyncio.run(_run())
+
+
+def test_agent_service_restart_barrier_preserves_same_runtime_fifo() -> None:
+    async def _run():
+        controller = _Controller()
+        service = AgentService(controller=controller)
+        controller.agent_service = service
+        agent = _RuntimeAgent()
+        service.register(agent)
+        service.begin_backend_drain("claude")
+
+        first_request = _request("first")
+        second_request = _request("second")
+        first = asyncio.create_task(service.handle_message("claude", first_request))
+        await asyncio.sleep(0)
+        second = asyncio.create_task(service.handle_message("claude", second_request))
+        await asyncio.sleep(0.01)
+
+        assert agent.started == []
+        assert service.runtime_turn_tokens_for_backend("claude") == {}
+
+        service.end_backend_drain("claude")
+        await asyncio.sleep(0)
+        assert agent.started == ["first"]
+
+        service.release_runtime_turn(first_request.context)
+        await asyncio.wait_for(first, timeout=3)
+        await asyncio.wait_for(second, timeout=3)
+        assert agent.started == ["first", "second"]
+
+    asyncio.run(_run())
+
+
+def test_agent_service_restart_wait_releases_gate_when_backend_disappears() -> None:
+    async def _run():
+        controller = _Controller()
+        service = AgentService(controller=controller)
+        controller.agent_service = service
+        service.register(_RuntimeAgent())
+        service.begin_backend_drain("claude")
+
+        request = _request("waiting")
+        task = asyncio.create_task(service.handle_message("claude", request))
+        await asyncio.sleep(0.01)
+        gate = service._turn_gates[request.composite_session_id]
+        assert gate.lock.locked() is True
+        assert gate.token == ""
+
+        service.agents.pop("claude")
+        service.end_backend_drain("claude")
+        with pytest.raises(KeyError):
+            await task
+        assert gate.lock.locked() is False
+
+    asyncio.run(_run())
+
+
+def test_force_end_backend_activities_settles_pending_runs() -> None:
+    settled = []
+    controller = SimpleNamespace(
+        scheduled_task_service=SimpleNamespace(settle_activity_runs=settled.append),
+    )
+    service = AgentService(controller=controller)
+    service.activities.start(
+        backend="claude",
+        runtime_key="runtime-1",
+        session_id="ses-1",
+        activity_id="task-active",
+        kind="background_task",
+        run_id="run-active",
+    )
+    service.activities.start(
+        backend="claude",
+        runtime_key="runtime-2",
+        session_id="ses-2",
+        activity_id="task-pending",
+        kind="background_task",
+        run_id="run-pending",
+    )
+    service.activities.complete(
+        backend="claude",
+        runtime_key="runtime-2",
+        activity_id="task-pending",
+        status="completed",
+        expects_output=True,
+    )
+
+    service.force_end_backend_activities("claude")
+
+    assert sorted((item.id, item.status) for item in settled) == [
+        ("task-active", "killed"),
+        ("task-pending", "killed"),
+    ]
+
+
+def test_force_cancel_backend_turns_emits_terminal_before_release() -> None:
+    async def _run():
+        controller = _Controller()
+        controller.emit_agent_message = AsyncMock()
+        service = AgentService(controller=controller)
+        controller.agent_service = service
+        agent = _RuntimeAgent(asyncio.Event())
+        service.register(agent)
+        request = _request("first")
+        task = asyncio.create_task(service.handle_message("claude", request))
+        await asyncio.sleep(0)
+        assert service.runtime_turn_tokens_for_backend("claude")
+
+        await service.force_cancel_backend_turns("claude")
+
+        assert task.cancelled()
+        controller.emit_agent_message.assert_awaited_once_with(
+            request.context,
+            "result",
+            "",
+            is_error=True,
+            level="silent",
+        )
+        assert service.runtime_turn_tokens_for_backend("claude") == {}
 
     asyncio.run(_run())
 

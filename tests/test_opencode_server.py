@@ -7,7 +7,7 @@ import tempfile
 import types
 import unittest
 from pathlib import Path
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -117,6 +117,51 @@ class _FakeSession:
 
 
 class OpenCodeServerTests(unittest.IsolatedAsyncioTestCase):
+    def test_terminate_instance_sync_stops_unadopted_managed_server(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            pid_file = Path(tmp_dir) / "opencode_server.json"
+            pid_file.write_text(json.dumps({"pid": 4321, "port": 4096}), encoding="utf-8")
+            terminate = Mock(return_value=True)
+            previous = OpenCodeServerManager._instance
+            OpenCodeServerManager._instance = None
+            try:
+                with (
+                    patch.object(SERVER_MODULE.paths, "get_logs_dir", return_value=Path(tmp_dir)),
+                    patch.object(
+                        SERVER_MODULE.runtime,
+                        "get_process_command",
+                        return_value="opencode serve --port=4096",
+                    ),
+                    patch.object(OpenCodeServerManager, "_terminate_pid_tree_sync", terminate),
+                ):
+                    OpenCodeServerManager.terminate_instance_sync()
+            finally:
+                OpenCodeServerManager._instance = previous
+
+        terminate.assert_called_once_with(4321)
+        self.assertFalse(pid_file.exists())
+
+    def test_terminate_instance_sync_trusts_pid_file_port_owner_without_command(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            pid_file = Path(tmp_dir) / "opencode_server.json"
+            pid_file.write_text(json.dumps({"pid": 4321, "port": 4096}), encoding="utf-8")
+            terminate = Mock(return_value=True)
+            previous = OpenCodeServerManager._instance
+            OpenCodeServerManager._instance = None
+            try:
+                with (
+                    patch.object(SERVER_MODULE.paths, "get_logs_dir", return_value=Path(tmp_dir)),
+                    patch.object(SERVER_MODULE.runtime, "get_process_command", return_value=None),
+                    patch.object(OpenCodeServerManager, "_pid_owns_listening_port", return_value=True),
+                    patch.object(OpenCodeServerManager, "_terminate_pid_tree_sync", terminate),
+                ):
+                    OpenCodeServerManager.terminate_instance_sync()
+            finally:
+                OpenCodeServerManager._instance = previous
+
+        terminate.assert_called_once_with(4321)
+        self.assertFalse(pid_file.exists())
+
     def test_percent_encode_path_preserves_round_trip_sensitive_paths(self):
         self.assertEqual(
             SERVER_MODULE._percent_encode_path("/tmp/小说"),
@@ -140,6 +185,7 @@ class OpenCodeServerTests(unittest.IsolatedAsyncioTestCase):
         manager._restart_for_auth_refresh_locked = AsyncMock(side_effect=lambda: restarted.append(True))  # type: ignore[method-assign]
         manager._start_server = AsyncMock(side_effect=lambda: started.append(True))  # type: ignore[method-assign]
         manager._read_pid_file = lambda: {"pid": 123, "port": 4096, "caller_context_path": manager._caller_context_path(), "owner_pid": SERVER_MODULE._CURRENT_OWNER_PID}  # type: ignore[method-assign]
+        manager._get_pid_command = lambda pid: "opencode serve --port=4096"  # type: ignore[method-assign]
 
         with patch.object(
             SERVER_MODULE,
@@ -161,6 +207,7 @@ class OpenCodeServerTests(unittest.IsolatedAsyncioTestCase):
         manager._restart_for_auth_refresh_locked = AsyncMock()  # type: ignore[method-assign]
         manager._start_server = AsyncMock()  # type: ignore[method-assign]
         manager._read_pid_file = lambda: {"pid": 123, "port": 4096, "caller_context_path": manager._caller_context_path(), "owner_pid": SERVER_MODULE._CURRENT_OWNER_PID}  # type: ignore[method-assign]
+        manager._get_pid_command = lambda pid: "opencode serve --port=4096"  # type: ignore[method-assign]
 
         with patch.object(
             SERVER_MODULE,
@@ -183,6 +230,7 @@ class OpenCodeServerTests(unittest.IsolatedAsyncioTestCase):
         manager._restart_for_auth_refresh_locked = AsyncMock(side_effect=lambda: restarted.append(True))  # type: ignore[method-assign]
         manager._start_server = AsyncMock(side_effect=lambda: started.append(True))  # type: ignore[method-assign]
         manager._read_pid_file = lambda: {"pid": 123, "port": 4096, "active_run_sessions": []}  # type: ignore[method-assign]
+        manager._get_pid_command = lambda pid: "opencode serve --port=4096"  # type: ignore[method-assign]
 
         with patch.object(
             SERVER_MODULE,
@@ -203,6 +251,7 @@ class OpenCodeServerTests(unittest.IsolatedAsyncioTestCase):
         manager._restart_for_auth_refresh_locked = AsyncMock()  # type: ignore[method-assign]
         manager._start_server = AsyncMock()  # type: ignore[method-assign]
         manager._read_pid_file = lambda: {"pid": 123, "port": 4096, "active_run_sessions": ["ses-active"]}  # type: ignore[method-assign]
+        manager._get_pid_command = lambda pid: "opencode serve --port=4096"  # type: ignore[method-assign]
 
         with patch.object(
             SERVER_MODULE,
@@ -223,6 +272,7 @@ class OpenCodeServerTests(unittest.IsolatedAsyncioTestCase):
         manager._restart_for_auth_refresh_locked = AsyncMock()  # type: ignore[method-assign]
         manager._start_server = AsyncMock()  # type: ignore[method-assign]
         manager._read_pid_file = lambda: {"pid": 123, "port": 4096}  # type: ignore[method-assign]
+        manager._get_pid_command = lambda pid: "opencode serve --port=4096"  # type: ignore[method-assign]
 
         with patch.object(
             SERVER_MODULE,
@@ -240,6 +290,7 @@ class OpenCodeServerTests(unittest.IsolatedAsyncioTestCase):
         manager = OpenCodeServerManager(binary="opencode", port=4096)
         with tempfile.TemporaryDirectory() as tmp_dir:
             manager._pid_file = Path(tmp_dir) / "opencode_server.json"
+            manager._get_pid_command = lambda pid: "opencode serve --port=4096"  # type: ignore[method-assign]
             manager._write_pid_file(123)
 
             await manager.mark_run_active("ses-active")
@@ -1291,6 +1342,83 @@ class OpenCodeServerTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(manager._auth_refresh_pending)
         self.assertIsNotNone(manager._process)
         self.assertEqual(manager._base_url, "http://127.0.0.1:4096")
+
+    async def test_restart_for_auth_refresh_force_clears_stale_activity(self):
+        manager = OpenCodeServerManager(binary="opencode", port=4096)
+        manager._active_requests = 2
+        manager._active_run_sessions.add("sess-stale")
+        manager._restart_for_auth_refresh_locked = AsyncMock()  # type: ignore[method-assign]
+
+        await manager.restart_for_auth_refresh(force=True)
+
+        self.assertEqual(manager._active_requests, 2)
+        self.assertEqual(manager._active_run_sessions, set())
+        manager._restart_for_auth_refresh_locked.assert_awaited_once()
+
+    def test_runtime_has_active_turns_reads_adopted_pid_state(self):
+        manager = OpenCodeServerManager(binary="opencode", port=4096)
+        manager._read_pid_file = lambda: {  # type: ignore[method-assign]
+            "pid": 321,
+            "port": 4096,
+            "active_run_sessions": ["sess-live"],
+        }
+        manager._pid_exists = lambda pid: pid == 321  # type: ignore[method-assign]
+        manager._get_pid_command = lambda pid: "opencode serve --port=4096"  # type: ignore[method-assign]
+
+        self.assertTrue(manager.runtime_has_active_turns())
+
+    def test_runtime_ignores_active_runs_from_reused_pid(self):
+        manager = OpenCodeServerManager(binary="opencode", port=4096)
+        manager._read_pid_file = lambda: {  # type: ignore[method-assign]
+            "pid": 321,
+            "port": 4096,
+            "active_run_sessions": ["sess-stale"],
+        }
+        manager._pid_exists = lambda pid: pid == 321  # type: ignore[method-assign]
+        manager._get_pid_command = lambda pid: "python unrelated.py"  # type: ignore[method-assign]
+
+        self.assertFalse(manager.runtime_has_active_turns())
+
+    def test_terminate_sync_falls_back_to_tracked_process_without_pid_file(self):
+        manager = OpenCodeServerManager(binary="opencode", port=4096)
+        manager._process = types.SimpleNamespace(pid=654, returncode=None)
+        manager._read_pid_file = lambda: None  # type: ignore[method-assign]
+        manager._pid_exists = lambda pid: pid == 654  # type: ignore[method-assign]
+        manager._get_pid_command = lambda pid: "opencode serve --port=4096"  # type: ignore[method-assign]
+        manager._clear_pid_file = Mock()  # type: ignore[method-assign]
+        manager._terminate_pid_tree_sync = Mock(return_value=True)  # type: ignore[method-assign]
+
+        manager.terminate_sync()
+
+        manager._terminate_pid_tree_sync.assert_called_once_with(654)
+        self.assertIsNone(manager._process)
+
+    def test_terminate_sync_does_not_kill_reused_tracked_pid(self):
+        manager = OpenCodeServerManager(binary="opencode", port=4096)
+        manager._process = types.SimpleNamespace(pid=654, returncode=None)
+        manager._read_pid_file = lambda: None  # type: ignore[method-assign]
+        manager._pid_exists = lambda pid: pid == 654  # type: ignore[method-assign]
+        manager._get_pid_command = lambda pid: "python unrelated.py"  # type: ignore[method-assign]
+        manager._clear_pid_file = Mock()  # type: ignore[method-assign]
+        manager._terminate_pid_tree_sync = Mock(return_value=True)  # type: ignore[method-assign]
+
+        manager.terminate_sync()
+
+        manager._terminate_pid_tree_sync.assert_not_called()
+        self.assertIsNone(manager._process)
+
+    def test_terminate_sync_trusts_pid_file_port_owner_without_command(self):
+        manager = OpenCodeServerManager(binary="opencode", port=4096)
+        manager._read_pid_file = lambda: {"pid": 654, "port": 4096}  # type: ignore[method-assign]
+        manager._pid_exists = lambda pid: pid == 654  # type: ignore[method-assign]
+        manager._get_pid_command = lambda pid: None  # type: ignore[method-assign]
+        manager._pid_owns_listening_port = lambda pid, port: pid == 654 and port == 4096  # type: ignore[method-assign]
+        manager._clear_pid_file = Mock()  # type: ignore[method-assign]
+        manager._terminate_pid_tree_sync = Mock(return_value=True)  # type: ignore[method-assign]
+
+        manager.terminate_sync()
+
+        manager._terminate_pid_tree_sync.assert_called_once_with(654)
 
     async def test_request_scope_does_not_restart_pending_auth_refresh_while_run_active(self):
         manager = OpenCodeServerManager(binary="opencode", port=4096)

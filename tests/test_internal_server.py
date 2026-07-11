@@ -21,7 +21,7 @@ import sys
 import tempfile
 import types
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, Mock
 
 import httpx
 from sqlalchemy import select
@@ -994,6 +994,7 @@ def test_release_for_backend_refresh_cancels_matching_turn_and_sets_idle():
             "agent_session_target": {"agent_backend": "codex"},
         }
         manager.in_flight["ses_codex"] = session_turns.Turn(task=task, context=ctx)
+        manager.begin_backend_drain("codex")
 
         released = await manager.release_for_backend_refresh(
             backend="codex",
@@ -1010,6 +1011,7 @@ def test_release_for_backend_refresh_cancels_matching_turn_and_sets_idle():
     assert released == 1
     assert cancelled is True
     assert statuses == [("ses_codex", "idle")]
+    assert manager._deferred_restart_sessions == {"codex": {"ses_codex"}}
 
 
 def test_release_for_backend_refresh_leaves_other_backend_turn_running():
@@ -1047,6 +1049,102 @@ def test_release_for_backend_refresh_leaves_other_backend_turn_running():
     assert released == 0
     assert done is False
     assert statuses == []
+
+
+def test_backend_drain_queues_idle_session_without_dispatching():
+    controller = _build_controller_double()
+    manager = session_turns.SessionTurnManager(controller)
+    enqueue = Mock()
+    context = MessageContext(user_id="U", channel_id="ses_codex", platform="avibe")
+    context.platform_specific = {
+        "agent_session_id": "ses_codex",
+        "agent_session_target": {"agent_backend": "codex"},
+    }
+
+    async def _go():
+        manager.begin_backend_drain("codex")
+        return await manager.submit("ses_codex", context, "next", enqueue=enqueue)
+
+    result = asyncio.run(_go())
+
+    assert result == "enqueued"
+    enqueue.assert_called_once_with()
+    assert manager.is_in_flight("ses_codex") is False
+    assert manager._deferred_restart_sessions == {"codex": {"ses_codex"}}
+
+
+def test_backend_drain_resolves_inherited_default_agent_backend():
+    controller = _build_controller_double()
+    controller.resolve_agent_for_context = Mock(return_value="codex")
+    manager = session_turns.SessionTurnManager(controller)
+    enqueue = Mock()
+    context = MessageContext(user_id="U", channel_id="ses_default", platform="avibe")
+    context.platform_specific = {
+        "agent_session_id": "ses_default",
+        "agent_session_target": {"agent_name": None, "agent_backend": None},
+    }
+
+    async def _go():
+        manager.begin_backend_drain("codex")
+        return await manager.submit("ses_default", context, "next", enqueue=enqueue)
+
+    assert asyncio.run(_go()) == "enqueued"
+    enqueue.assert_called_once_with()
+    controller.resolve_agent_for_context.assert_called_once_with(context)
+    assert manager._deferred_restart_sessions == {"codex": {"ses_default"}}
+
+
+def test_backend_drain_flushes_deferred_session_after_cutover():
+    controller = _build_controller_double()
+    manager = session_turns.SessionTurnManager(controller)
+    manager.flush_queue = AsyncMock(return_value=True)
+    manager.begin_backend_drain("codex")
+    manager._deferred_restart_sessions["codex"].add("ses_codex")
+
+    asyncio.run(manager.end_backend_drain("codex"))
+
+    manager.flush_queue.assert_awaited_once_with("ses_codex")
+    assert "codex" not in manager._draining_backends
+
+
+def test_backend_drain_blocks_direct_queue_flush():
+    controller = _build_controller_double()
+    context = MessageContext(user_id="U", channel_id="ses_codex", platform="avibe")
+    context.platform_specific = {
+        "agent_session_id": "ses_codex",
+        "agent_session_target": {"agent_backend": "codex"},
+    }
+    manager = session_turns.SessionTurnManager(controller, build_context=lambda _session_id: context)
+    manager._run = AsyncMock()  # type: ignore[method-assign]
+    manager.begin_backend_drain("codex")
+
+    assert asyncio.run(manager.flush_queue("ses_codex")) is False
+    manager._run.assert_not_awaited()
+    assert manager._deferred_restart_sessions == {"codex": {"ses_codex"}}
+
+
+def test_stop_during_backend_drain_keeps_existing_queue_parked():
+    controller = _build_controller_double()
+    manager = session_turns.SessionTurnManager(controller)
+    context = MessageContext(user_id="U", channel_id="ses_codex", platform="avibe")
+    context.platform_specific = {
+        "agent_session_id": "ses_codex",
+        "agent_session_target": {"agent_backend": "codex"},
+    }
+
+    async def _go():
+        task = asyncio.create_task(asyncio.sleep(60))
+        manager.in_flight["ses_codex"] = session_turns.Turn(task=task, context=context)
+        manager.begin_backend_drain("codex")
+        manager._deferred_restart_sessions["codex"].add("ses_codex")
+        result = await manager.cancel("ses_codex")
+        await asyncio.gather(task, return_exceptions=True)
+        return result
+
+    result = asyncio.run(_go())
+
+    assert result["status"] == "cancel_requested"
+    assert manager._deferred_restart_sessions == {"codex": set()}
 
 
 # ---------------------------------------------------------------------

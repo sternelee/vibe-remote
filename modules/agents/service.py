@@ -31,6 +31,49 @@ class AgentService:
         # Strong refs to fire-and-forget tasks (e.g. the cancellation tidy) so the
         # event loop doesn't GC them before they run (asyncio only weak-refs tasks).
         self._background_tasks: set[asyncio.Task] = set()
+        self._backend_ready: dict[str, asyncio.Event] = {}
+
+    def _backend_ready_event(self, backend: str) -> asyncio.Event:
+        event = self._backend_ready.get(backend)
+        if event is None:
+            event = asyncio.Event()
+            event.set()
+            self._backend_ready[backend] = event
+        return event
+
+    def begin_backend_drain(self, backend: str) -> None:
+        self._backend_ready_event(backend).clear()
+
+    def end_backend_drain(self, backend: str) -> None:
+        self._backend_ready_event(backend).set()
+
+    async def wait_backend_ready(self, backend: str) -> None:
+        await self._backend_ready_event(backend).wait()
+
+    async def prepare_backend_restart(self, backend: str) -> None:
+        agent = self.agents.get(backend)
+        prepare = getattr(agent, "prepare_runtime_restart", None)
+        if callable(prepare):
+            await prepare()
+
+    def backend_runtime_active(self, backend: str) -> bool:
+        if self.activities.has_backend_work(backend):
+            return True
+        agent = self.agents.get(backend)
+        probe = getattr(agent, "runtime_has_active_turns", None)
+        if not callable(probe):
+            return False
+        try:
+            return bool(probe())
+        except Exception:
+            logger.debug("Backend active-runtime probe failed for %s", backend, exc_info=True)
+            return True
+
+    def force_end_backend_activities(self, backend: str) -> list[Any]:
+        completed = self.activities.end_backend(backend, status="killed")
+        for activity in completed:
+            self.on_activity_terminal(activity)
+        return completed
 
     def register(self, agent: BaseAgent):
         self.agents[agent.name] = agent
@@ -111,9 +154,34 @@ class AgentService:
                     except Exception:
                         logger.debug("Failed to clean up queued reaction on cancel", exc_info=True)
             raise
+        # A restart may have started while this turn waited behind the previous
+        # owner of the runtime key. Keep the key lock, wait for cutover, then
+        # resolve the current adapter so the queued turn cannot enter the old
+        # generation.
+        try:
+            await self.wait_backend_ready(agent_name)
+            agent = self.get(agent_name)
+        except BaseException:
+            if queued_reaction_task is not None:
+                try:
+                    await queued_reaction_task
+                except BaseException:
+                    pass
+                if indicator is not None:
+                    try:
+                        await indicator.finish(request)
+                    except Exception:
+                        logger.debug("Failed to clean up queued reaction on restart-wait cancel", exc_info=True)
+            if gate.lock.locked() and not gate.token:
+                gate.lock.release()
+            raise
         gate.token = uuid.uuid4().hex
         gate.backend = agent.name
+        gate.agent = agent
         gate.runtime_started = False
+        gate.task = asyncio.current_task()
+        gate.context = request.context
+        gate.cancel_tidy_task = None
         self._stamp_runtime_turn(request, runtime_key, gate.token)
         try:
             # Register the indicator handle for terminal/cancel cleanup BEFORE the
@@ -184,6 +252,7 @@ class AgentService:
                             self.release_runtime_turn(request.context)
 
                     tidy_task = asyncio.create_task(_tidy_on_cancel())
+                    gate.cancel_tidy_task = tidy_task
                     self._background_tasks.add(tidy_task)
                     tidy_task.add_done_callback(self._background_tasks.discard)
                     scheduled = True
@@ -244,9 +313,12 @@ class AgentService:
             self.release_runtime_turn_key(runtime_key, runtime_token)
 
     async def handle_stop(self, agent_name: str, request: AgentRequest) -> bool:
-        agent = self.get(agent_name)
-        runtime_key = self._runtime_turn_key(agent, request)
+        current_agent = self.get(agent_name)
+        payload = getattr(request.context, "platform_specific", None) or {}
+        stamped_key = str(payload.get(AGENT_RUNTIME_TURN_KEY) or "").strip()
+        runtime_key = stamped_key or self._runtime_turn_key(current_agent, request)
         gate = self._turn_gates.get(runtime_key)
+        agent = gate.agent if gate is not None and gate.agent is not None else current_agent
         if gate is not None and gate.token:
             self._stamp_runtime_turn(request, runtime_key, gate.token)
         handled = await agent.handle_stop(request)
@@ -399,8 +471,46 @@ class AgentService:
         gate.token = ""
         gate.backend = ""
         gate.runtime_started = False
+        gate.agent = None
+        gate.task = None
+        gate.context = None
         if gate.lock.locked():
             gate.lock.release()
+
+    async def force_cancel_backend_turns(self, backend: str) -> None:
+        """Cancel every foreground owner and emit a terminal outcome before cutover."""
+        owned = [
+            (runtime_key, gate, gate.token)
+            for runtime_key, gate in self._turn_gates.items()
+            if gate.backend == backend and gate.token
+        ]
+        tasks = {
+            gate.task
+            for _runtime_key, gate, _token in owned
+            if gate.task is not None and not gate.task.done()
+        }
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.wait(tasks, timeout=2.0)
+        tidies = {
+            gate.cancel_tidy_task
+            for _runtime_key, gate, _token in owned
+            if gate.cancel_tidy_task is not None and not gate.cancel_tidy_task.done()
+        }
+        if tidies:
+            await asyncio.wait(tidies, timeout=2.0)
+        emit = getattr(self.controller, "emit_agent_message", None)
+        for runtime_key, gate, token in owned:
+            if gate.token != token:
+                continue
+            context = gate.context
+            if context is not None and callable(emit):
+                try:
+                    await emit(context, "result", "", is_error=True, level="silent")
+                except Exception:
+                    logger.debug("Failed to settle forced backend turn %s", runtime_key, exc_info=True)
+            self.release_runtime_turn_key(runtime_key, token)
 
     def emit_matches_runtime_turn(self, context: Any) -> bool:
         payload = getattr(context, "platform_specific", None) or {}
@@ -419,7 +529,9 @@ class AgentService:
         runtime_key = str(payload.get(AGENT_RUNTIME_TURN_KEY) or "").strip()
         gate = self._turn_gates.get(runtime_key) if runtime_key else None
         backend = gate.backend if gate else None
-        agent = self.agents.get(backend) if backend else None
+        agent = getattr(gate, "agent", None) if gate is not None else None
+        if agent is None and backend:
+            agent = self.agents.get(backend)
         if agent is None:
             return None
         probe = getattr(agent, "backend_alive", None)
@@ -528,3 +640,7 @@ class _RuntimeTurnGate:
     token: str = ""
     backend: str = ""
     runtime_started: bool = False
+    agent: BaseAgent | None = None
+    task: asyncio.Task | None = None
+    context: Any = None
+    cancel_tidy_task: asyncio.Task | None = None
