@@ -45,6 +45,29 @@ class ResultMessage:
     subtype = "success"
     result = "✅ master 回归环境已就绪"
     duration_ms = 1
+    duration_api_ms = 1
+    session_id = "claude-native-session"
+
+    def __init__(self, *, num_turns: int = 1):
+        self.num_turns = num_turns
+
+
+class TaskStartedMessage:
+    subtype = "task_started"
+    task_id = "task-690"
+    description = "Background verification"
+    task_type = "local_agent"
+    tool_use_id = "tool-690"
+    data = {}
+
+
+class TaskNotificationMessage:
+    subtype = "task_notification"
+    task_id = "task-690"
+    status = "completed"
+    output_file = "/tmp/task-690.output"
+    summary = "Background verification finished"
+    data = {}
 
 
 def _assistant_then_result_client():
@@ -64,6 +87,68 @@ def _one_result_client():
         def receive_messages(self):
             async def _iterate():
                 yield ResultMessage()
+
+            return _iterate()
+
+    return _Client()
+
+
+def _two_result_client():
+    class _Client:
+        def receive_messages(self):
+            async def _iterate():
+                yield ResultMessage(num_turns=1)
+                yield ResultMessage(num_turns=2)
+
+            return _iterate()
+
+    return _Client()
+
+
+def _completed_task_then_result_client():
+    class _Client:
+        def receive_messages(self):
+            async def _iterate():
+                yield TaskStartedMessage()
+                yield TaskNotificationMessage()
+                yield ResultMessage()
+
+            return _iterate()
+
+    return _Client()
+
+
+def _task_notification_then_result_client():
+    class _Client:
+        def receive_messages(self):
+            async def _iterate():
+                yield TaskNotificationMessage()
+                yield ResultMessage()
+
+            return _iterate()
+
+    return _Client()
+
+
+def _completed_task_notification_client():
+    class _Client:
+        def receive_messages(self):
+            async def _iterate():
+                yield TaskStartedMessage()
+                yield TaskNotificationMessage()
+
+            return _iterate()
+
+    return _Client()
+
+
+def _completed_task_notification_then_wait_client(release: asyncio.Event):
+    class _Client:
+        def receive_messages(self):
+            async def _iterate():
+                yield TaskStartedMessage()
+                yield TaskNotificationMessage()
+                await release.wait()
 
             return _iterate()
 
@@ -234,6 +319,615 @@ class BeginAgentInitiatedTurnTests(unittest.IsolatedAsyncioTestCase):
 
 
 class ReceiverOpensAgentInitiatedTurnTests(unittest.IsolatedAsyncioTestCase):
+    async def test_claude_query_waits_until_background_output_is_consumed(self):
+        agent, service = _build_agent()
+        composite_key = "session-serialized:/tmp/work"
+        service.activities.start(
+            backend="claude",
+            runtime_key=composite_key,
+            session_id="sess-serialized",
+            activity_id="task-690",
+            kind="local_agent",
+        )
+
+        waiter = asyncio.create_task(agent._wait_for_activity_output(composite_key))
+        await asyncio.sleep(0)
+        self.assertFalse(waiter.done())
+
+        service.activities.complete(
+            backend="claude",
+            runtime_key=composite_key,
+            activity_id="task-690",
+            status="completed",
+            expects_output=True,
+        )
+        agent._signal_activity_output_settled(composite_key)
+        await asyncio.sleep(0)
+        self.assertFalse(waiter.done())
+
+        self.assertIsNotNone(
+            service.activities.claim_completed_output("claude", composite_key)
+        )
+        agent._signal_activity_output_settled(composite_key)
+        await asyncio.wait_for(waiter, timeout=1)
+
+    async def test_terminal_only_task_event_keeps_current_turn_origin(self):
+        agent, service = _build_agent()
+        composite_key = "session-terminal-only:/tmp/work"
+        pending_context = SimpleNamespace(
+            platform_specific={"turn_token": "current-turn"},
+        )
+        agent._pending_requests[composite_key] = [SimpleNamespace(context=pending_context)]
+        context = SimpleNamespace(
+            platform_specific={"agent_session_id": "sess-terminal-only"},
+        )
+
+        self.assertTrue(
+            agent._handle_activity_message(
+                TaskNotificationMessage(),
+                composite_key,
+                context,
+            )
+        )
+
+        activity = service.activities.claim_completed_output("claude", composite_key)
+        self.assertIsNotNone(activity)
+        self.assertEqual(activity.turn_id, "current-turn")
+
+    async def test_completed_task_notification_at_eof_delivers_summary(self):
+        agent, service = _build_agent()
+        composite_key = "session-eof:/tmp/work"
+        context = SimpleNamespace(
+            user_id="U1",
+            channel_id="C1",
+            platform="avibe",
+            platform_specific={
+                "agent_runtime_turn_key": composite_key,
+                "agent_runtime_turn_token": "old-turn",
+                "turn_token": "origin-turn",
+                "agent_session_id": "sess-eof",
+            },
+        )
+        agent.emit_result_message = AsyncMock()
+
+        await agent._receive_messages(
+            _completed_task_notification_client(),
+            "session-eof",
+            "/tmp/work",
+            context,
+            composite_key=composite_key,
+        )
+
+        agent.emit_result_message.assert_awaited_once()
+        self.assertEqual(
+            agent.emit_result_message.await_args.args[1],
+            "Background verification finished",
+        )
+        output = agent.emit_result_message.await_args.kwargs["output"]
+        self.assertTrue(output.detached)
+        self.assertFalse(output.completes_turn)
+        self.assertTrue(output.completes_run)
+        self.assertIsNone(service.activities.claim_completed_output("claude", composite_key))
+
+    async def test_completed_task_notification_flushes_while_receiver_stays_open(self):
+        agent, service = _build_agent()
+        agent.ACTIVITY_OUTPUT_FLUSH_GRACE_SECONDS = 0
+        composite_key = "session-live-flush:/tmp/work"
+        context = SimpleNamespace(
+            user_id="U1",
+            channel_id="C1",
+            platform="avibe",
+            platform_specific={
+                "agent_runtime_turn_key": composite_key,
+                "agent_runtime_turn_token": "old-turn",
+                "turn_token": "origin-turn",
+                "agent_session_id": "sess-live-flush",
+            },
+        )
+        emitted = asyncio.Event()
+
+        async def _emit(*_args, **_kwargs):
+            emitted.set()
+
+        agent.emit_result_message = AsyncMock(side_effect=_emit)
+        release = asyncio.Event()
+        receiver = asyncio.create_task(
+            agent._receive_messages(
+                _completed_task_notification_then_wait_client(release),
+                "session-live-flush",
+                "/tmp/work",
+                context,
+                composite_key=composite_key,
+            )
+        )
+        try:
+            await asyncio.wait_for(emitted.wait(), timeout=1)
+            self.assertFalse(receiver.done())
+            output = agent.emit_result_message.await_args.kwargs["output"]
+            self.assertTrue(output.detached)
+            self.assertFalse(output.completes_turn)
+            self.assertTrue(output.completes_run)
+            self.assertIsNone(
+                service.activities.claim_completed_output("claude", composite_key)
+            )
+        finally:
+            release.set()
+            await receiver
+
+    async def test_timed_flush_keeps_activity_for_a_newer_pending_turn(self):
+        agent, service = _build_agent()
+        composite_key = "session-deferred-flush:/tmp/work"
+        pending_context = SimpleNamespace(platform_specific={"turn_token": "newer-turn"})
+        agent._pending_requests[composite_key] = [SimpleNamespace(context=pending_context)]
+        context = SimpleNamespace(platform_specific={"agent_session_id": "sess-deferred"})
+        service.activities.start(
+            backend="claude",
+            runtime_key=composite_key,
+            session_id="sess-deferred",
+            activity_id="task-690",
+            kind="local_agent",
+            turn_id="origin-turn",
+        )
+        service.activities.complete(
+            backend="claude",
+            runtime_key=composite_key,
+            activity_id="task-690",
+            status="completed",
+            metadata={"summary": "Background verification finished"},
+            expects_output=True,
+        )
+        agent.emit_result_message = AsyncMock()
+
+        should_retry = await agent._flush_completed_activity_outputs(composite_key, context)
+
+        self.assertTrue(should_retry)
+        agent.emit_result_message.assert_not_awaited()
+        claimed = service.activities.claim_completed_output("claude", composite_key)
+        self.assertIsNotNone(claimed)
+        self.assertEqual(claimed.turn_id, "origin-turn")
+
+    async def test_requeued_terminal_only_activity_flushes_after_pending_turn(self):
+        agent, service = _build_agent()
+        agent.ACTIVITY_OUTPUT_FLUSH_GRACE_SECONDS = 0
+        composite_key = "session-retry-flush:/tmp/work"
+        agent._pending_requests[composite_key] = [
+            SimpleNamespace(
+                context=SimpleNamespace(platform_specific={"turn_token": "newer-turn"})
+            )
+        ]
+        context = SimpleNamespace(platform_specific={"agent_session_id": "sess-retry"})
+        service.activities.start(
+            backend="claude",
+            runtime_key=composite_key,
+            session_id="sess-retry",
+            activity_id="task-690",
+            kind="local_agent",
+            turn_id="origin-turn",
+        )
+        service.activities.complete(
+            backend="claude",
+            runtime_key=composite_key,
+            activity_id="task-690",
+            status="completed",
+            metadata={"summary": "Background verification finished"},
+            expects_output=True,
+        )
+        requeued = asyncio.Event()
+        original_requeue = service.activities.requeue_completed_output
+
+        def _requeue(activity, *, front=True):
+            original_requeue(activity, front=front)
+            requeued.set()
+
+        service.activities.requeue_completed_output = _requeue
+        emitted = asyncio.Event()
+        agent.emit_result_message = AsyncMock(side_effect=lambda *_a, **_k: emitted.set())
+
+        agent._schedule_completed_activity_flush(composite_key, context)
+        await asyncio.wait_for(requeued.wait(), timeout=1)
+        agent._pending_requests.pop(composite_key)
+        await asyncio.wait_for(emitted.wait(), timeout=1)
+
+        self.assertFalse(service.activities.has_completed_output("claude", composite_key))
+        self.assertFalse(agent._activity_output_pending(composite_key))
+
+    async def test_runtime_disconnect_marks_session_idle_after_activity_cleanup(self):
+        mark_idle_calls: list[str] = []
+        agent, service = _build_agent(mark_idle_calls=mark_idle_calls)
+        composite_key = "session-disconnected:/tmp/work"
+        service.activities.start(
+            backend="claude",
+            runtime_key=composite_key,
+            session_id="sess-disconnected",
+            activity_id="task-690",
+            kind="local_agent",
+        )
+
+        agent._end_activity_runtime(composite_key)
+
+        self.assertFalse(service.activities.has_active("claude", composite_key))
+        self.assertEqual(mark_idle_calls, [composite_key])
+
+    async def test_task_start_uses_current_request_run_not_stale_receiver_run(self):
+        agent, service = _build_agent()
+        composite_key = "session-lineage:/tmp/work"
+        pending_context = SimpleNamespace(
+            platform_specific={
+                "task_trigger_kind": "agent_run",
+                "task_execution_id": "run-current",
+                "turn_token": "current-turn",
+            }
+        )
+        agent._pending_requests[composite_key] = [SimpleNamespace(context=pending_context)]
+        receiver_context = SimpleNamespace(
+            platform_specific={
+                "task_trigger_kind": "agent_run",
+                "task_execution_id": "run-stale",
+                "turn_token": "stale-turn",
+                "agent_session_id": "sess-lineage",
+            }
+        )
+
+        self.assertTrue(
+            agent._handle_activity_message(
+                TaskStartedMessage(),
+                composite_key,
+                receiver_context,
+            )
+        )
+
+        activity = service.activities.active_for_runtime("claude", composite_key)[0]
+        self.assertEqual(activity.run_id, "run-current")
+        self.assertEqual(activity.turn_id, "current-turn")
+        self.assertEqual(activity.metadata["run_ids"], ["run-current"])
+
+    async def test_task_progress_keeps_original_run_lineage(self):
+        agent, service = _build_agent()
+        composite_key = "session-progress-lineage:/tmp/work"
+        origin_context = SimpleNamespace(
+            platform_specific={
+                "task_trigger_kind": "agent_run",
+                "task_execution_id": "run-origin",
+                "turn_token": "turn-origin",
+            }
+        )
+        agent._pending_requests[composite_key] = [SimpleNamespace(context=origin_context)]
+        receiver_context = SimpleNamespace(
+            platform_specific={"agent_session_id": "sess-progress-lineage"},
+        )
+        self.assertTrue(
+            agent._handle_activity_message(
+                TaskStartedMessage(),
+                composite_key,
+                receiver_context,
+            )
+        )
+
+        newer_context = SimpleNamespace(
+            platform_specific={
+                "task_trigger_kind": "agent_run",
+                "task_execution_id": "run-newer",
+                "turn_token": "turn-newer",
+            }
+        )
+        agent._pending_requests[composite_key] = [SimpleNamespace(context=newer_context)]
+        progress = SimpleNamespace(
+            subtype="task_progress",
+            task_id="task-690",
+            description="Still working",
+            data={},
+        )
+        self.assertTrue(
+            agent._handle_activity_message(
+                progress,
+                composite_key,
+                receiver_context,
+            )
+        )
+
+        activity = service.activities.active_for_runtime("claude", composite_key)[0]
+        self.assertEqual(activity.run_id, "run-origin")
+        self.assertEqual(activity.turn_id, "turn-origin")
+        self.assertEqual(activity.metadata["run_ids"], ["run-origin"])
+
+        self.assertTrue(
+            agent._handle_activity_message(
+                TaskNotificationMessage(),
+                composite_key,
+                receiver_context,
+            )
+        )
+        completed = service.activities.claim_completed_output("claude", composite_key)
+        self.assertIsNotNone(completed)
+        self.assertEqual(completed.run_id, "run-origin")
+        self.assertEqual(completed.turn_id, "turn-origin")
+        self.assertEqual(completed.metadata["run_ids"], ["run-origin"])
+
+    async def test_failed_task_does_not_claim_a_missing_followup_output(self):
+        mark_idle_calls: list[str] = []
+        agent, service = _build_agent(mark_idle_calls=mark_idle_calls)
+        composite_key = "session-failed:/tmp/work"
+        context = SimpleNamespace(
+            platform_specific={"agent_session_id": "sess-failed"},
+        )
+        failed = TaskNotificationMessage()
+        failed.status = "failed"
+
+        self.assertTrue(agent._handle_activity_message(TaskStartedMessage(), composite_key, context))
+        self.assertTrue(agent._handle_activity_message(failed, composite_key, context))
+
+        self.assertIsNone(service.activities.claim_completed_output("claude", composite_key))
+        self.assertEqual(mark_idle_calls, [composite_key])
+
+    async def test_completed_background_task_output_does_not_settle_newer_user_turn(self):
+        agent, service = _build_agent()
+        composite_key = "session-690:/tmp/work"
+        gate = service._get_turn_gate(composite_key)
+        await gate.lock.acquire()
+        gate.token = "USER-TURN"
+        gate.backend = "claude"
+        gate.runtime_started = True
+        user_context = SimpleNamespace(
+            platform_specific={
+                "agent_runtime_turn_key": composite_key,
+                "agent_runtime_turn_token": "USER-TURN",
+                "turn_token": "user-turn",
+            }
+        )
+        user_request = SimpleNamespace(context=user_context)
+        agent._pending_requests[composite_key] = [user_request]
+        agent._pending_assistant_message[composite_key] = "newer turn draft"
+        receiver_context = SimpleNamespace(
+            user_id="U1",
+            channel_id="C1",
+            platform="avibe",
+            platform_specific={
+                "agent_runtime_turn_key": composite_key,
+                "agent_runtime_turn_token": "OLD-TURN",
+                "turn_token": "old-turn",
+                "agent_session_id": "sess-690",
+            },
+        )
+        agent.emit_result_message = AsyncMock()
+        service.activities.start(
+            backend="claude",
+            runtime_key=composite_key,
+            session_id="sess-690",
+            activity_id="task-690",
+            kind="local_agent",
+            parent_activity_id="tool-690",
+            turn_id="origin-turn",
+        )
+
+        await agent._receive_messages(
+            _task_notification_then_result_client(),
+            "session-690",
+            "/tmp/work",
+            receiver_context,
+            composite_key=composite_key,
+        )
+
+        agent.emit_result_message.assert_awaited_once()
+        output = agent.emit_result_message.await_args.kwargs["output"]
+        self.assertTrue(output.detached)
+        self.assertFalse(output.completes_turn)
+        self.assertTrue(output.completes_run)
+        self.assertEqual(output.activity_id, "task-690")
+        self.assertEqual(output.causation_id, "tool-690")
+        self.assertEqual(output.provenance(receiver_context)["turn_id"], "origin-turn")
+        self.assertEqual(agent._pending_requests[composite_key], [user_request])
+        self.assertEqual(agent._pending_assistant_message[composite_key], "newer turn draft")
+        # Hard #862 invariant: background delivery cannot settle a newer Turn.
+        self.assertEqual(gate.token, "USER-TURN")
+        self.assertTrue(gate.lock.locked())
+        agent.controller.emit_agent_message.assert_not_awaited()
+
+    async def test_contended_activity_result_does_not_poison_next_user_result(self):
+        agent, service = _build_agent()
+        composite_key = "session-contended:/tmp/work"
+        gate = service._get_turn_gate(composite_key)
+        await gate.lock.acquire()
+        gate.token = "USER-TURN"
+        gate.backend = "claude"
+        context = SimpleNamespace(
+            user_id="U1",
+            channel_id="C1",
+            platform="avibe",
+            platform_specific={
+                "agent_runtime_turn_key": composite_key,
+                "agent_runtime_turn_token": "OLD-TURN",
+                "turn_token": "old-turn",
+                "agent_session_id": "sess-contended",
+            },
+        )
+        agent.emit_result_message = AsyncMock()
+        service.activities.start(
+            backend="claude",
+            runtime_key=composite_key,
+            session_id="sess-contended",
+            activity_id="task-690",
+            kind="local_agent",
+            turn_id="origin-turn",
+        )
+        service.activities.complete(
+            backend="claude",
+            runtime_key=composite_key,
+            activity_id="task-690",
+            status="completed",
+            metadata={"summary": "Background verification finished"},
+            expects_output=True,
+        )
+
+        mode = await agent._maybe_begin_agent_initiated_turn(
+            context,
+            composite_key,
+            "session-contended",
+            "/tmp/work",
+            "session-key",
+            message_type="result",
+        )
+
+        self.assertEqual(mode, "activity")
+        agent.emit_result_message.assert_not_awaited()
+        self.assertIn(composite_key, agent._detached_activity_outputs)
+        self.assertEqual(gate.token, "USER-TURN")
+
+        await agent._receive_messages(
+            _one_result_client(),
+            "session-contended",
+            "/tmp/work",
+            context,
+            composite_key=composite_key,
+        )
+
+        first_call = agent.emit_result_message.await_args
+        activity_output = first_call.kwargs["output"]
+        self.assertTrue(activity_output.detached)
+        self.assertFalse(activity_output.completes_turn)
+        self.assertNotIn(composite_key, agent._detached_activity_outputs)
+        self.assertEqual(gate.token, "USER-TURN")
+
+        user_request = SimpleNamespace(
+            context=SimpleNamespace(
+                platform_specific={
+                    "agent_runtime_turn_key": composite_key,
+                    "agent_runtime_turn_token": "USER-TURN",
+                    "turn_token": "user-turn",
+                }
+            )
+        )
+        agent._pending_requests[composite_key] = [user_request]
+        await agent._receive_messages(
+            _one_result_client(),
+            "session-contended",
+            "/tmp/work",
+            context,
+            composite_key=composite_key,
+        )
+
+        self.assertEqual(agent.emit_result_message.await_count, 2)
+        user_result_call = agent.emit_result_message.await_args
+        self.assertIs(user_result_call.kwargs["request"], user_request)
+        self.assertNotIn("output", user_result_call.kwargs)
+        self.assertFalse(agent._has_pending_requests(composite_key))
+        gate.lock.release()
+
+    async def test_contended_schedule_wakeup_result_is_delivered_detached(self):
+        agent, service = _build_agent()
+        composite_key = "session-wakeup:/tmp/work"
+        gate = service._get_turn_gate(composite_key)
+        await gate.lock.acquire()
+        gate.token = "USER-TURN"
+        gate.backend = "claude"
+        context = SimpleNamespace(
+            user_id="U1",
+            channel_id="C1",
+            platform="avibe",
+            platform_specific={
+                "agent_runtime_turn_key": composite_key,
+                "agent_runtime_turn_token": "OLD-TURN",
+                "agent_session_id": "sess-wakeup",
+            },
+        )
+        agent.emit_result_message = AsyncMock()
+        try:
+            await agent._receive_messages(
+                _one_result_client(),
+                "session-wakeup",
+                "/tmp/work",
+                context,
+                composite_key=composite_key,
+            )
+        finally:
+            gate.lock.release()
+
+        agent.emit_result_message.assert_awaited_once()
+        output = agent.emit_result_message.await_args.kwargs["output"]
+        self.assertTrue(output.detached)
+        self.assertFalse(output.completes_turn)
+        self.assertFalse(output.completes_run)
+        self.assertEqual(gate.token, "USER-TURN")
+        self.assertFalse(agent._has_pending_requests(composite_key))
+
+    async def test_identical_schedule_wakeup_results_get_distinct_output_ids(self):
+        agent, service = _build_agent()
+        composite_key = "session-repeat-wakeup:/tmp/work"
+        gate = service._get_turn_gate(composite_key)
+        await gate.lock.acquire()
+        gate.token = "USER-TURN"
+        gate.backend = "claude"
+        context = SimpleNamespace(
+            user_id="U1",
+            channel_id="C1",
+            platform="avibe",
+            platform_specific={
+                "agent_runtime_turn_key": composite_key,
+                "agent_runtime_turn_token": "OLD-TURN",
+                "agent_session_id": "sess-repeat-wakeup",
+            },
+        )
+        agent.emit_result_message = AsyncMock()
+        try:
+            await agent._receive_messages(
+                _two_result_client(),
+                "session-repeat-wakeup",
+                "/tmp/work",
+                context,
+                composite_key=composite_key,
+            )
+        finally:
+            gate.lock.release()
+
+        self.assertEqual(agent.emit_result_message.await_count, 2)
+        output_ids = [
+            call.kwargs["output"].idempotency_key
+            for call in agent.emit_result_message.await_args_list
+        ]
+        self.assertEqual(len(set(output_ids)), 2)
+
+    async def test_task_completed_inside_its_origin_turn_remains_attached(self):
+        agent, service = _build_agent()
+        composite_key = "session-current:/tmp/work"
+        gate = service._get_turn_gate(composite_key)
+        await gate.lock.acquire()
+        gate.token = "CURRENT-TURN"
+        gate.backend = "claude"
+        user_context = SimpleNamespace(
+            platform_specific={
+                "agent_runtime_turn_key": composite_key,
+                "agent_runtime_turn_token": "CURRENT-TURN",
+                "turn_token": "current-turn",
+            }
+        )
+        agent._pending_requests[composite_key] = [SimpleNamespace(context=user_context)]
+        receiver_context = SimpleNamespace(
+            user_id="U1",
+            channel_id="C1",
+            platform="avibe",
+            platform_specific={
+                "agent_runtime_turn_key": composite_key,
+                "agent_runtime_turn_token": "CURRENT-TURN",
+                "turn_token": "current-turn",
+                "agent_session_id": "sess-current",
+            },
+        )
+        agent.emit_result_message = AsyncMock()
+
+        await agent._receive_messages(
+            _completed_task_then_result_client(),
+            "session-current",
+            "/tmp/work",
+            receiver_context,
+            composite_key=composite_key,
+        )
+
+        output = agent.emit_result_message.await_args.kwargs["request"].output
+        self.assertFalse(output.detached)
+        self.assertTrue(output.completes_turn)
+        self.assertTrue(output.completes_run)
+        self.assertEqual(output.activity_id, "task-690")
+        self.assertFalse(agent._has_pending_requests(composite_key))
+
     async def test_non_actionable_fallback_does_not_open_agent_initiated_turn(self):
         active_calls: list[str] = []
         agent, service = _build_agent(active_calls=active_calls)
@@ -331,9 +1025,12 @@ class ReceiverOpensAgentInitiatedTurnTests(unittest.IsolatedAsyncioTestCase):
 
         # Capture whether the guard would pass at the moment the result is emitted.
         guard_at_emit: list[bool] = []
+        token_at_emit: list[str] = []
 
         async def _capture_result(ctx, *a, **k):
             guard_at_emit.append(service.emit_matches_runtime_turn(ctx))
+            token_at_emit.append(service._get_turn_gate(composite_key).token)
+            service.release_runtime_turn(ctx)
 
         agent.emit_result_message = AsyncMock(side_effect=_capture_result)
 
@@ -350,8 +1047,9 @@ class ReceiverOpensAgentInitiatedTurnTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(guard_at_emit, [True])
         # A real agent-initiated turn was opened (fresh token, not the stale one).
         gate = service._get_turn_gate(composite_key)
-        self.assertNotEqual(gate.token, "OLD")
-        self.assertTrue(gate.token)
+        self.assertNotEqual(token_at_emit, ["OLD"])
+        self.assertTrue(token_at_emit[0])
+        self.assertEqual(gate.token, "")
         # INBOUND chokepoint fired once and the turn settled (synthetic request popped).
         self.assertEqual(len(running_calls), 1)
         # Marked active on open (eviction parity with a user turn) then idle on settle.

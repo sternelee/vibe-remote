@@ -29,6 +29,25 @@ try:
         UserMessage,
     )
     from claude_agent_sdk._errors import CLIConnectionError, MessageParseError
+
+    try:
+        from claude_agent_sdk import (  # type: ignore[import-not-found]
+            TaskNotificationMessage,
+            TaskProgressMessage,
+            TaskStartedMessage,
+        )
+    except ImportError:
+        # Task lifecycle frames were added after the core SDK types. Avibe
+        # detects them by class name/subtype, so an older SDK can keep running.
+        class TaskStartedMessage(SystemMessage):
+            pass
+
+        class TaskProgressMessage(SystemMessage):
+            pass
+
+        class TaskNotificationMessage(SystemMessage):
+            pass
+
     CLAUDE_SDK_AVAILABLE = True
 
     def _should_ignore_message_parse_error(data: object) -> bool:
@@ -90,6 +109,15 @@ except ModuleNotFoundError:  # pragma: no cover - exercised only in minimal test
         pass
 
     class ResultMessage:
+        pass
+
+    class TaskStartedMessage(SystemMessage):
+        pass
+
+    class TaskProgressMessage(SystemMessage):
+        pass
+
+    class TaskNotificationMessage(SystemMessage):
         pass
 
     class TextBlock:

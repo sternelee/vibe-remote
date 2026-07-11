@@ -4,6 +4,8 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Any, Dict, Optional
 
+from core.session_activities import SessionActivityRegistry
+
 from .base import (
     AGENT_RUNTIME_TURN_KEY,
     AGENT_RUNTIME_TURN_TOKEN,
@@ -25,6 +27,7 @@ class AgentService:
         self.agents: Dict[str, BaseAgent] = {}
         self.default_agent = "claude"
         self._turn_gates: dict[str, _RuntimeTurnGate] = {}
+        self.activities = SessionActivityRegistry()
         # Strong refs to fire-and-forget tasks (e.g. the cancellation tidy) so the
         # event loop doesn't GC them before they run (asyncio only weak-refs tasks).
         self._background_tasks: set[asyncio.Task] = set()
@@ -32,6 +35,30 @@ class AgentService:
     def register(self, agent: BaseAgent):
         self.agents[agent.name] = agent
         logger.info(f"Registered agent backend: {agent.name}")
+
+    def on_activity_terminal(self, activity: Any) -> None:
+        """Let the Run owner react after the registry removed one Activity."""
+
+        service = getattr(self.controller, "scheduled_task_service", None)
+        settle = getattr(service, "settle_activity_runs", None)
+        if not callable(settle):
+            return
+        try:
+            settle(activity)
+        except Exception:
+            logger.warning(
+                "Failed to settle Runs for terminal Activity %s",
+                getattr(activity, "id", ""),
+                exc_info=True,
+            )
+
+    def end_activity_runtime(self, backend: str, runtime_key: str) -> list[Any]:
+        """Terminate one backend connection's Activities and notify Run owners."""
+
+        completed = self.activities.end_runtime(backend, runtime_key)
+        for activity in completed:
+            self.on_activity_terminal(activity)
+        return completed
 
     def get(self, agent_name: Optional[str]) -> BaseAgent:
         target = agent_name or self.default_agent
@@ -252,6 +279,15 @@ class AgentService:
             return False
         gate = self._turn_gates.get(runtime_key)
         return bool(gate is not None and gate.token == runtime_token and gate.runtime_started)
+
+    def runtime_turn_active(self, runtime_key: str) -> bool:
+        """Whether a foreground turn holds or is queued on this backend runtime."""
+
+        gate = self._turn_gates.get(str(runtime_key or "").strip())
+        return bool(
+            gate is not None
+            and (gate.lock.locked() or self._lock_has_live_waiters(gate.lock))
+        )
 
     @staticmethod
     def _lock_has_live_waiters(lock: asyncio.Lock) -> bool:
