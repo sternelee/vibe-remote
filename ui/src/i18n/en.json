@@ -118,8 +118,8 @@
   },
   "more": {
     "title": "More",
-    "controlPanel": "Control Panel",
-    "controlPanelDesc": "Channels · Users · Show Pages · Settings · Logs",
+    "controlPanel": "Settings",
+    "controlPanelDesc": "Dashboard · Remote Access · Messaging Platforms · Backends · Advanced Settings",
     "appearance": "Appearance",
     "connection": "Connection",
     "host": "Local address"
@@ -738,7 +738,8 @@
       "minimize": "Minimize",
       "maximize": "Maximize",
       "restore": "Restore",
-      "openInNewTab": "Open in New Tab"
+      "openInNewTab": "Open in New Tab",
+      "openChat": "Open Chat"
     },
     "preview": {
       "label": "Preview",

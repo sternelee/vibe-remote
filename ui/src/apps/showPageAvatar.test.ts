@@ -1,6 +1,13 @@
 import { describe, expect, it } from 'vitest';
 
-import { SHOW_PAGE_ACCENTS, accentForSession, firstGrapheme, showPageAvatar, showPagePrivatePath } from './showPageAvatar';
+import {
+  SHOW_PAGE_ACCENTS,
+  accentForSession,
+  firstGrapheme,
+  sessionChatPath,
+  showPageAvatar,
+  showPagePrivatePath,
+} from './showPageAvatar';
 
 describe('firstGrapheme', () => {
   it('takes the first letter of an ASCII title', () => {
@@ -70,5 +77,20 @@ describe('showPagePrivatePath', () => {
   it('always points at the private /show/ surface, url-encoded', () => {
     expect(showPagePrivatePath('ses_1')).toBe('/show/ses_1/');
     expect(showPagePrivatePath('a/b')).toBe('/show/a%2Fb/');
+  });
+});
+
+describe('sessionChatPath', () => {
+  it('points at the in-app chat route for the session, url-encoded', () => {
+    expect(sessionChatPath('ses_1')).toBe('/chat/ses_1');
+    expect(sessionChatPath('a/b')).toBe('/chat/a%2Fb');
+  });
+
+  it('appends the ?view=chat show-me-the-chat signal only when requested', () => {
+    expect(sessionChatPath('ses_1', { showChat: true })).toBe('/chat/ses_1?view=chat');
+    expect(sessionChatPath('a/b', { showChat: true })).toBe('/chat/a%2Fb?view=chat');
+    // Omitted / falsy keeps the plain canonical route (no stray query).
+    expect(sessionChatPath('ses_1', {})).toBe('/chat/ses_1');
+    expect(sessionChatPath('ses_1', { showChat: false })).toBe('/chat/ses_1');
   });
 });

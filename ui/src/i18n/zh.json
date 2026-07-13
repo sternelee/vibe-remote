@@ -118,8 +118,8 @@
   },
   "more": {
     "title": "更多",
-    "controlPanel": "控制面板",
-    "controlPanelDesc": "频道 · 用户 · 展示页面 · 设置 · 日志",
+    "controlPanel": "设置",
+    "controlPanelDesc": "控制台 · 远程访问 · 通讯平台 · 后端 · 高级设置",
     "appearance": "外观",
     "connection": "连接",
     "host": "本机地址"
@@ -738,7 +738,8 @@
       "minimize": "最小化",
       "maximize": "最大化",
       "restore": "还原",
-      "openInNewTab": "在新标签页打开"
+      "openInNewTab": "在新标签页打开",
+      "openChat": "打开聊天"
     },
     "preview": {
       "label": "预览",

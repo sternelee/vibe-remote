@@ -1,10 +1,12 @@
 import { useEffect, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
+import { useNavigate } from 'react-router-dom';
 import clsx from 'clsx';
-import { ExternalLink, Minus, Plus, X, type LucideIcon } from 'lucide-react';
+import { ExternalLink, MessageCircle, Minus, Plus, X, type LucideIcon } from 'lucide-react';
 
 import { APP_REGISTRY } from '../../apps/registry';
 import { useWindowManager, type WindowInstance } from '../../context/WindowManagerContext';
+import { useUnsavedChangesActionGuard } from '../../context/useUnsavedChangesActionGuard';
 import { clampToLayer, resizeBounds, type ResizeDir } from '../../lib/windowBounds';
 import { ErrorBoundary } from '../ui/error-boundary';
 
@@ -26,6 +28,10 @@ export const AppWindow: React.FC<{ win: WindowInstance; layerWidth: number; laye
 }) => {
   const { t } = useTranslation();
   const wm = useWindowManager();
+  const navigate = useNavigate();
+  // Gate the chat-bubble's SPA navigation through the same unsaved-changes guard the
+  // sidebar uses, so a route-level dirty blocker can veto it (and the minimize) as one.
+  const authorizeRouteAction = useUnsavedChangesActionGuard();
   const def = APP_REGISTRY[win.appId];
   const rootRef = useRef<HTMLDivElement | null>(null);
   const draggingRef = useRef(false);
@@ -109,6 +115,9 @@ export const AppWindow: React.FC<{ win: WindowInstance; layerWidth: number; laye
   // A standalone-surface app (v1: showpage) exposes an external URL for its own
   // browser tab; the title bar then shows an open-in-new-tab button.
   const externalHref = def.externalHref?.(win.params);
+  // The same app may own a session chat (v1: showpage) — the title bar then also
+  // shows a chat-bubble button that jumps there and minimizes this window.
+  const chatHref = def.chatHref?.(win.params);
 
   const style: React.CSSProperties = win.maximized
     ? { left: 0, top: 0, width: layerWidth, height: layerHeight, zIndex: win.z }
@@ -229,8 +238,33 @@ export const AppWindow: React.FC<{ win: WindowInstance; layerWidth: number; laye
           <span className="truncate text-[13px] font-semibold text-foreground">{win.title ?? t(def.titleKey)}</span>
         </div>
         {/* Right cluster balances the traffic lights so the title stays centered; a
-            standalone-surface app also gets an open-in-new-tab button here. */}
-        <div className="flex w-[52px] shrink-0 items-center justify-end">
+            standalone-surface app (showpage) also gets a chat-bubble + open-in-new-tab
+            pair here — two size-6 buttons + gap-1 fill the 52px box exactly. */}
+        <div className="flex w-[52px] shrink-0 items-center justify-end gap-1">
+          {chatHref && (
+            <button
+              type="button"
+              title={t('apps.window.openChat')}
+              aria-label={t('apps.window.openChat')}
+              // Stop the titlebar drag/focus gesture from starting on this click.
+              onPointerDown={(e) => e.stopPropagation()}
+              onClick={(e) => {
+                e.stopPropagation();
+                // A route-level unsaved-changes blocker can veto this navigation; authorize
+                // first so a cancelled prompt aborts the WHOLE action instead of half-applying
+                // (window minimized into the Dock while the route never left the dirty page).
+                const authorization = authorizeRouteAction();
+                if (!authorization) return;
+                // Jump to the owning session's chat and drop the window to the Dock
+                // (chat visible immediately; the Dock thumbnail brings the app back).
+                authorization.runNavigation(() => navigate(chatHref));
+                wm.minimize(win.id);
+              }}
+              className="grid size-6 place-items-center rounded-md text-muted transition hover:bg-foreground/[0.06] hover:text-foreground"
+            >
+              <MessageCircle className="size-3.5" />
+            </button>
+          )}
           {externalHref && (
             <a
               href={externalHref}
