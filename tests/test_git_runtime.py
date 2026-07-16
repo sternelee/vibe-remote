@@ -6,6 +6,7 @@ import json
 import os
 import stat
 import tarfile
+import urllib.error
 from pathlib import Path
 
 import pytest
@@ -80,6 +81,31 @@ def test_manifest_parses_and_exposes_archive(tmp_path: Path, monkeypatch: pytest
     assert status["archive"]["binary_sha256"] == json.loads(manifest.read_text(encoding="utf-8"))[
         "archives"
     ][managed_runtime.runtime_platform_tag()]["binary_sha256"]
+
+
+def test_archive_download_retries_transient_network_failure(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("AVIBE_HOME", str(tmp_path / "home"))
+    archive = _write_git_archive(tmp_path)
+    manifest = _write_manifest(tmp_path, archive)
+    payload = json.loads(manifest.read_text(encoding="utf-8"))
+    payload["archives"][managed_runtime.runtime_platform_tag()]["url"] = "https://example.test/git.tar.gz"
+    manifest.write_text(json.dumps(payload), encoding="utf-8")
+    attempts = 0
+
+    def opener(_request, timeout):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise urllib.error.URLError(ConnectionResetError("reset"))
+        return io.BytesIO(archive.read_bytes())
+
+    monkeypatch.setattr(managed_runtime.urllib.request, "urlopen", opener)
+    monkeypatch.setattr("core.dependency_network.time.sleep", lambda _delay: None)
+
+    result = GitRuntimeManager(manifest_path=manifest).ensure()
+
+    assert result["ok"] is True
+    assert attempts == 2
 
 
 def test_packaged_manifest_matches_published_four_platform_release(tmp_path: Path) -> None:
@@ -221,6 +247,46 @@ def test_checksum_mismatch_installs_nothing(tmp_path: Path, monkeypatch: pytest.
     assert result["ok"] is False
     assert result["reason"] == "git_archive_checksum_mismatch"
     assert manager.resolve_git_path() is None
+
+
+def test_successful_archive_fetch_clears_stale_download_error_before_checksum_failure(tmp_path: Path) -> None:
+    archive = _write_git_archive(tmp_path)
+    manifest = _write_manifest(tmp_path, archive, sha256="1" * 64)
+    manager = GitRuntimeManager(runtime_dir=tmp_path / "runtime", manifest_path=manifest)
+    manager._download_error = {"kind": "timeout", "message": "old timeout"}
+
+    result = manager.ensure()
+
+    assert result["reason"] == "git_archive_checksum_mismatch"
+    assert "old timeout" not in result["message"]
+    assert result["download_error"] is None
+
+
+def test_archive_probe_rejects_unsupported_scheme_before_network(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    archive = _write_git_archive(tmp_path)
+    manifest = _write_manifest(tmp_path, archive)
+    payload = json.loads(manifest.read_text(encoding="utf-8"))
+    payload["archives"][managed_runtime.runtime_platform_tag()]["url"] = (
+        "http://user:secret@example.test/git.tar.gz?token=secret"
+    )
+    manifest.write_text(json.dumps(payload), encoding="utf-8")
+    monkeypatch.setattr(
+        managed_runtime,
+        "probe_url",
+        lambda *_args, **_kwargs: pytest.fail("unsupported URL must not be probed"),
+    )
+
+    result = GitRuntimeManager(runtime_dir=tmp_path / "runtime", manifest_path=manifest).probe_archive_reachability()
+
+    assert result == {
+        "ok": False,
+        "checked": False,
+        "reason": "git_archive_url_unsupported",
+        "url": "http://example.test/git.tar.gz",
+    }
 
 
 def test_binary_checksum_mismatch_installs_nothing(

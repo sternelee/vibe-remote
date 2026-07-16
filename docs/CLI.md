@@ -113,6 +113,11 @@ vibe doctor repair home-migration --yes
 vibe doctor repair duplicate-service-processes --yes
 vibe doctor repair stale-install-runtime --yes
 vibe doctor repair stale-restart-state --yes
+vibe doctor repair askill --yes
+vibe doctor repair avault --yes
+vibe doctor repair git-runtime --yes
+vibe doctor repair show-runtime --yes
+vibe doctor repair tmux --yes
 ```
 
 **Checks:**
@@ -121,6 +126,9 @@ vibe doctor repair stale-restart-state --yes
 - Agent CLI availability (Claude Code, OpenCode, Codex)
 - Runtime home migration state
 - Runtime process, install, and restart metadata state
+- askill, avault, Git Runtime, Show Runtime, tmux, and Node.js readiness through one dependency diagnostic group
+- `vibe doctor --deep` also probes missing dependencies without downloading their bodies
+- managed downloads retry transient HTTP, DNS, timeout, and connection failures with bounded backoff
 
 ### `vibe remote`
 

@@ -1038,6 +1038,472 @@ def test_doctor_repair_dry_run_does_not_probe_runtime(monkeypatch):
     assert result["results"][0]["status"] == "planned"
 
 
+def test_show_runtime_doctor_fast_mode_reports_local_state_without_network(monkeypatch):
+    status = {
+        "provider": "manifest-cache",
+        "platform": "linux-x64",
+        "explicit_command": None,
+        "node_available": True,
+        "node_version": "22.14.0",
+        "node_supported": True,
+        "manifest": {"runtime_version": "runtime-ref"},
+        "archive": {
+            "name": "vibe-show-runtime-node-linux-x64.tgz",
+            "url": "https://github.com/avibe-bot/avibe/releases/download/v3.0.5/vibe-show-runtime-node-linux-x64.tgz",
+        },
+        "installed": False,
+    }
+    manager = SimpleNamespace(
+        status=lambda: status,
+        probe_archive_reachability=lambda: (_ for _ in ()).throw(AssertionError("fast Doctor must not probe network")),
+    )
+    monkeypatch.setattr("core.show_runtime.ShowRuntimeManager", lambda **_kwargs: manager)
+
+    items = cli._show_runtime_doctor_items(deep=False)
+
+    assert next(item for item in items if item.get("code") == "show_runtime.not_ready")["repair"]["target"] == "show-runtime"
+    assert next(item for item in items if item.get("code") == "show_runtime.archive_probe_skipped")["status"] == "pass"
+
+
+def test_managed_dependencies_doctor_uses_one_status_contract(monkeypatch):
+    offline_calls: list[bool] = []
+
+    def status(*, offline=False):
+        offline_calls.append(offline)
+        return {
+            "deps": [
+                {"id": "askill", "required": True, "installed": False, "status": "missing"},
+                {"id": "avault", "required": True, "installed": True, "status": "ready", "version": "0.1.6"},
+                {"id": "show-runtime", "required": True, "installed": False, "status": "missing"},
+                {"id": "tmux", "required": False, "installed": False, "status": "missing"},
+                {"id": "git-runtime", "required": False, "installed": True, "status": "ready"},
+                {"id": "node", "required": True, "installed": False, "status": "missing"},
+            ]
+        }
+
+    monkeypatch.setattr(cli.api, "dependencies_status", status)
+    monkeypatch.setattr(cli.api, "askill_auto_install_supported", lambda: True)
+
+    items = cli._managed_dependencies_doctor_items(deep=False)
+
+    assert offline_calls == [True]
+    assert next(item for item in items if item.get("code") == "dependencies.askill.not_ready")["repair"]["target"] == "askill"
+    assert next(item for item in items if item.get("code") == "dependencies.avault.ready")["status"] == "pass"
+    assert next(item for item in items if item.get("code") == "dependencies.git-runtime.ready")["status"] == "pass"
+    assert next(item for item in items if item.get("code") == "dependencies.tmux.not_ready")["status"] == "warn"
+    assert next(item for item in items if item.get("code") == "dependencies.node.not_ready")["status"] == "fail"
+
+
+def test_managed_dependencies_doctor_suppresses_unsupported_askill_repair(monkeypatch):
+    monkeypatch.setattr(
+        cli.api,
+        "dependencies_status",
+        lambda **_kwargs: {
+            "deps": [
+                {"id": "askill", "required": True, "installed": False, "status": "missing"},
+                {"id": "git-runtime", "required": False, "installed": True, "status": "ready"},
+            ]
+        },
+    )
+    monkeypatch.setattr(cli.api, "askill_auto_install_supported", lambda: False)
+
+    items = cli._managed_dependencies_doctor_items(deep=False)
+
+    missing = next(item for item in items if item.get("code") == "dependencies.askill.not_ready")
+    assert "repair" not in missing
+    assert "askill.sh" in missing["action"]
+
+
+def test_managed_dependencies_doctor_does_not_offer_unsupported_platform_repair(monkeypatch):
+    monkeypatch.setattr(
+        cli.api,
+        "dependencies_status",
+        lambda **_kwargs: {
+            "deps": [
+                {
+                    "id": "tmux",
+                    "required": False,
+                    "installed": False,
+                    "status": "missing",
+                    "reason": "tmux_platform_unsupported",
+                },
+                {"id": "git-runtime", "required": False, "installed": True, "status": "ready"},
+            ]
+        },
+    )
+
+    items = cli._managed_dependencies_doctor_items(deep=False)
+
+    unsupported = next(
+        item for item in items if item.get("code") == "dependencies.tmux.platform_unsupported"
+    )
+    assert unsupported["status"] == "warn"
+    assert "repair" not in unsupported
+    assert not any(item.get("code") == "dependencies.tmux.not_ready" for item in items)
+
+
+def test_managed_dependencies_doctor_accepts_usable_system_git(monkeypatch):
+    monkeypatch.setattr(cli.api, "dependencies_status", lambda **_kwargs: {"deps": []})
+    monkeypatch.setattr(
+        "core.git_runtime.git_runtime_status",
+        lambda: {
+            "resolution": "system",
+            "path": "/usr/bin/git",
+            "version": None,
+            "managed": {
+                "installed": False,
+                "status": "missing",
+                "reason": "git_platform_unsupported",
+            },
+        },
+    )
+
+    items = cli._managed_dependencies_doctor_items(deep=False)
+
+    system_git = next(
+        item for item in items if item.get("code") == "dependencies.git-runtime.system_ready"
+    )
+    assert system_git["status"] == "pass"
+    assert not any(item.get("code") == "dependencies.git-runtime.not_ready" for item in items)
+
+
+def test_managed_dependencies_doctor_does_not_offer_unsupported_git_runtime_repair(monkeypatch):
+    monkeypatch.setattr(cli.api, "dependencies_status", lambda **_kwargs: {"deps": []})
+    monkeypatch.setattr(
+        "core.git_runtime.git_runtime_status",
+        lambda: {
+            "resolution": "none",
+            "path": None,
+            "version": None,
+            "managed": {
+                "installed": False,
+                "status": "missing",
+                "reason": "git_platform_unsupported",
+            },
+        },
+    )
+
+    items = cli._managed_dependencies_doctor_items(deep=False)
+
+    unsupported = next(
+        item
+        for item in items
+        if item.get("code") == "dependencies.git-runtime.platform_unsupported"
+    )
+    assert unsupported["status"] == "warn"
+    assert "repair" not in unsupported
+
+
+def test_managed_dependencies_doctor_rejects_unsupported_archive_url_without_repair(monkeypatch):
+    monkeypatch.setattr(
+        cli.api,
+        "dependencies_status",
+        lambda **_kwargs: {
+            "deps": [
+                {"id": "git-runtime", "required": False, "installed": False, "status": "missing"},
+            ]
+        },
+    )
+    manager = SimpleNamespace(
+        probe_archive_reachability=lambda: {
+            "ok": False,
+            "checked": False,
+            "reason": "git_archive_url_unsupported",
+            "url": "http://example.test/git.tar.gz",
+        }
+    )
+    monkeypatch.setattr("core.git_runtime.GitRuntimeManager", lambda **_kwargs: manager)
+
+    items = cli._managed_dependencies_doctor_items(deep=True)
+
+    unsupported = next(
+        item
+        for item in items
+        if item.get("code") == "dependencies.git-runtime.archive_url_unsupported"
+    )
+    assert unsupported["status"] == "warn"
+    assert "repair" not in unsupported
+    assert not any(item.get("code") == "dependencies.git-runtime.not_ready" for item in items)
+
+
+def test_managed_dependencies_doctor_deep_reports_retry_exhaustion(monkeypatch):
+    monkeypatch.setattr(
+        cli.api,
+        "dependencies_status",
+        lambda **_kwargs: {
+            "deps": [
+                {"id": "askill", "required": True, "installed": False, "status": "missing"},
+                {"id": "git-runtime", "required": False, "installed": True, "status": "ready"},
+            ]
+        },
+    )
+    monkeypatch.setattr(
+        "core.dependency_network.probe_url",
+        lambda *_args, **_kwargs: {
+            "ok": False,
+            "checked": True,
+            "download_error": {
+                "kind": "timeout",
+                "url": "https://askill.sh",
+                "attempts": 2,
+                "retryable": True,
+            },
+        },
+    )
+
+    items = cli._managed_dependencies_doctor_items(deep=True)
+
+    failure = next(item for item in items if item.get("code") == "dependencies.askill.download_timeout_failed")
+    assert "after 2 attempts" in failure["message"]
+
+
+def test_repair_managed_dependency_preserves_structured_download_error():
+    error = {"kind": "dns", "attempts": 3, "retryable": True}
+
+    result = cli._repair_managed_dependency(
+        "avault",
+        lambda force: {
+            "ok": False,
+            "reason": "avault_download_failed",
+            "message": "download failed",
+            "download_error": error,
+        },
+    )
+
+    assert result["status"] == "failed"
+    assert result["download_error"] == error
+
+
+def test_show_runtime_doctor_deep_mode_distinguishes_missing_release_asset(monkeypatch):
+    archive_url = (
+        "https://github.com/avibe-bot/avibe/releases/download/"
+        "v3.0.5/vibe-show-runtime-node-linux-x64.tgz"
+    )
+    status = {
+        "provider": "manifest-cache",
+        "platform": "linux-x64",
+        "explicit_command": None,
+        "node_available": True,
+        "node_version": "22.14.0",
+        "node_supported": True,
+        "manifest": {"runtime_version": "runtime-ref"},
+        "archive": {"name": "vibe-show-runtime-node-linux-x64.tgz", "url": archive_url},
+        "installed": False,
+    }
+    manager = SimpleNamespace(
+        status=lambda: status,
+        probe_archive_reachability=lambda: {
+            "ok": False,
+            "checked": True,
+            "reason": "runtime_archive_download_failed",
+            "download_error": {
+                "kind": "http",
+                "message": "HTTP 404 Not Found",
+                "url": archive_url,
+                "host": "github.com",
+                "http_status": 404,
+            },
+        },
+    )
+    monkeypatch.setattr("core.show_runtime.ShowRuntimeManager", lambda **_kwargs: manager)
+
+    items = cli._show_runtime_doctor_items(deep=True)
+
+    failure = next(item for item in items if item.get("code") == "show_runtime.archive_http_404")
+    assert failure["status"] == "fail"
+    assert "proxy or security gateway" in failure["action"]
+
+
+def test_show_runtime_doctor_reports_unchecked_manifest_download_failure(monkeypatch):
+    archive_url = "https://example.test/runtime.tgz"
+    status = {
+        "provider": "manifest-cache",
+        "platform": "linux-x64",
+        "explicit_command": None,
+        "node_available": True,
+        "node_version": "22.14.0",
+        "node_supported": True,
+        "manifest": {"runtime_version": "runtime-ref"},
+        "archive": {"name": "runtime.tgz", "url": archive_url},
+        "installed": False,
+    }
+    manager = SimpleNamespace(
+        status=lambda: status,
+        probe_archive_reachability=lambda: {
+            "ok": False,
+            "checked": False,
+            "reason": "runtime_manifest_download_failed",
+            "download_error": {
+                "kind": "timeout",
+                "message": "Connection timed out",
+                "url": "https://example.test/manifest.json",
+                "attempts": 2,
+            },
+        },
+    )
+    monkeypatch.setattr("core.show_runtime.ShowRuntimeManager", lambda **_kwargs: manager)
+
+    items = cli._show_runtime_doctor_items(deep=True)
+
+    failure = next(item for item in items if item.get("code") == "show_runtime.manifest_timeout_failed")
+    assert failure["status"] == "fail"
+    assert "after 2 attempts" in failure["message"]
+    assert not any(item.get("code") == "show_runtime.archive_probe_unsupported" for item in items)
+
+
+def test_show_runtime_doctor_reports_unsupported_archive_url(monkeypatch):
+    archive_url = "http://example.test/runtime.tgz"
+    status = {
+        "provider": "manifest-cache",
+        "platform": "linux-x64",
+        "explicit_command": None,
+        "node_available": True,
+        "node_version": "22.14.0",
+        "node_supported": True,
+        "manifest": {"runtime_version": "runtime-ref"},
+        "archive": {"name": "runtime.tgz", "url": archive_url},
+        "installed": False,
+    }
+    manager = SimpleNamespace(
+        status=lambda: status,
+        probe_archive_reachability=lambda: {
+            "ok": False,
+            "checked": False,
+            "reason": "runtime_archive_url_unsupported",
+            "url": archive_url,
+        },
+    )
+    monkeypatch.setattr("core.show_runtime.ShowRuntimeManager", lambda **_kwargs: manager)
+
+    items = cli._show_runtime_doctor_items(deep=True)
+
+    failure = next(item for item in items if item.get("code") == "show_runtime.archive_url_unsupported")
+    assert failure["status"] == "fail"
+    assert "HTTPS or file URL" in failure["action"]
+    not_ready = next(item for item in items if item.get("code") == "show_runtime.not_ready")
+    assert "repair" not in not_ready
+    assert "doctor repair" not in not_ready["action"]
+
+
+def test_show_runtime_doctor_only_treats_explicit_head_failure_as_probe_unsupported(monkeypatch):
+    archive_url = "https://example.test/runtime.tgz"
+    status = {
+        "provider": "manifest-cache",
+        "platform": "linux-x64",
+        "explicit_command": None,
+        "node_available": True,
+        "node_version": "22.14.0",
+        "node_supported": True,
+        "manifest": {"runtime_version": "runtime-ref"},
+        "archive": {"name": "runtime.tgz", "url": archive_url},
+        "installed": False,
+    }
+    manager = SimpleNamespace(
+        status=lambda: status,
+        probe_archive_reachability=lambda: {
+            "ok": False,
+            "checked": False,
+            "reason": "runtime_archive_probe_unsupported",
+            "download_error": {
+                "kind": "http",
+                "message": "HTTP 405 Method Not Allowed",
+                "url": archive_url,
+                "http_status": 405,
+            },
+        },
+    )
+    monkeypatch.setattr("core.show_runtime.ShowRuntimeManager", lambda **_kwargs: manager)
+
+    items = cli._show_runtime_doctor_items(deep=True)
+
+    warning = next(item for item in items if item.get("code") == "show_runtime.archive_probe_unsupported")
+    assert warning["status"] == "warn"
+    assert not any(item.get("code") == "show_runtime.archive_http_error" for item in items)
+
+
+def test_show_runtime_doctor_identifies_legacy_upstream_fallback(monkeypatch):
+    status = {
+        "provider": "archive",
+        "platform": "darwin-arm64",
+        "explicit_command": None,
+        "node_available": True,
+        "node_version": "22.14.0",
+        "node_supported": True,
+        "manifest": None,
+        "archive": {
+            "name": "vibe-show-runtime-node-darwin-arm64.tgz",
+            "url": "https://github.com/avibe-bot/vibe-show-runtime/releases/latest/download/"
+            "vibe-show-runtime-node-darwin-arm64.tgz",
+        },
+        "installed": False,
+    }
+    manager = SimpleNamespace(status=lambda: status)
+    monkeypatch.setattr("core.show_runtime.ShowRuntimeManager", lambda **_kwargs: manager)
+
+    items = cli._show_runtime_doctor_items(deep=False)
+
+    failure = next(item for item in items if item.get("code") == "show_runtime.legacy_archive_provider")
+    assert failure["status"] == "fail"
+    assert "does not publish release assets" in failure["action"]
+    assert "repair" not in next(item for item in items if item.get("code") == "show_runtime.not_ready")
+
+
+def test_repair_show_runtime_returns_structured_download_failure(monkeypatch):
+    archive_url = "https://github.com/avibe-bot/avibe/releases/download/v-test/runtime.tgz"
+    manager = SimpleNamespace(
+        status=lambda: {
+            "provider": "manifest-cache",
+            "platform": "linux-x64",
+            "archive": {"url": archive_url},
+            "installed": False,
+        },
+        prepare=lambda force=False: {
+            "ok": False,
+            "provider": "manifest-cache",
+            "platform": "linux-x64",
+            "reason": "runtime_archive_download_failed",
+            "status": {
+                "download_error": {
+                    "kind": "timeout",
+                    "message": "Connection timed out",
+                    "url": archive_url,
+                }
+            },
+        },
+    )
+    monkeypatch.setattr("core.show_runtime.ShowRuntimeManager", lambda: manager)
+
+    result = cli._repair_show_runtime()
+
+    assert result["status"] == "failed"
+    assert result["reason"] == "runtime_archive_download_failed"
+    assert result["download_error"]["kind"] == "timeout"
+    assert archive_url in result["message"]
+
+
+def test_repair_show_runtime_prepares_missing_runtime(monkeypatch, tmp_path):
+    manager = SimpleNamespace(
+        status=lambda: {
+            "provider": "manifest-cache",
+            "platform": "linux-x64",
+            "archive": {"url": "https://github.com/avibe-bot/avibe/releases/download/v-test/runtime.tgz"},
+            "installed": False,
+        },
+        prepare=lambda force=False: {
+            "ok": True,
+            "provider": "manifest-cache",
+            "platform": "linux-x64",
+            "status": {"install_dir": str(tmp_path / "runtime")},
+        },
+    )
+    monkeypatch.setattr("core.show_runtime.ShowRuntimeManager", lambda: manager)
+
+    result = cli._repair_show_runtime()
+
+    assert result["status"] == "repaired"
+    assert result["install_dir"] == str(tmp_path / "runtime")
+
+
 def test_doctor_repair_refreshes_diagnostics_after_repair(monkeypatch):
     paths.ensure_data_dirs()
     restart_path = runtime.get_restart_status_path()
@@ -1055,8 +1521,59 @@ def test_doctor_repair_refreshes_diagnostics_after_repair(monkeypatch):
     assert result["ok"] is True
     assert result["results"][0]["status"] == "repaired"
     assert refreshed == [True]
-    assert doctor_calls == [True]
+    assert doctor_calls == [False]
     assert result["doctor"] == {"ok": True, "groups": []}
+
+
+def test_bare_doctor_repair_keeps_post_repair_refresh_local(monkeypatch):
+    handlers = {
+        "_repair_home_migration": "repaired",
+        "_repair_stale_install_runtime": "skipped",
+        "_repair_duplicate_service_processes": "skipped",
+        "_repair_stale_restart_state": "skipped",
+    }
+    for name, status in handlers.items():
+        target = name.removeprefix("_repair_").replace("_", "-")
+        monkeypatch.setattr(
+            cli,
+            name,
+            lambda *, dry_run=False, target=target, status=status: {
+                "target": target,
+                "status": status,
+                "message": status,
+            },
+        )
+    doctor_calls = []
+    monkeypatch.setattr(cli, "_doctor", lambda *, deep=False: doctor_calls.append(deep) or {"ok": True})
+
+    result = cli._repair_doctor_targets([], dry_run=False)
+
+    assert result["ok"] is True
+    assert doctor_calls == [False]
+
+
+def test_dependency_or_deep_repair_requests_deep_post_repair_refresh(monkeypatch):
+    monkeypatch.setattr(
+        cli,
+        "_repair_askill",
+        lambda *, dry_run=False: {"target": "askill", "status": "repaired", "message": "done"},
+    )
+    monkeypatch.setattr(
+        cli,
+        "_repair_stale_restart_state",
+        lambda *, dry_run=False: {
+            "target": "stale-restart-state",
+            "status": "repaired",
+            "message": "done",
+        },
+    )
+    doctor_calls = []
+    monkeypatch.setattr(cli, "_doctor", lambda *, deep=False: doctor_calls.append(deep) or {"ok": True})
+
+    cli._repair_doctor_targets(["askill"], dry_run=False)
+    cli._repair_doctor_targets(["stale-restart-state"], dry_run=False, deep=True)
+
+    assert doctor_calls == [True, True]
 
 
 def test_restart_parser_accepts_delay_seconds():
@@ -1075,6 +1592,22 @@ def test_doctor_parser_accepts_repair_target_and_dry_run():
     assert args.doctor_action == "repair"
     assert args.doctor_repair_targets == ["duplicate-service-processes"]
     assert args.dry_run is True
+
+
+def test_doctor_parser_accepts_show_runtime_repair_target():
+    parser = cli.build_parser()
+    args = parser.parse_args(["doctor", "repair", "show-runtime", "--yes"])
+
+    assert args.doctor_repair_targets == ["show-runtime"]
+
+
+def test_doctor_parser_accepts_managed_dependency_repair_targets():
+    parser = cli.build_parser()
+
+    for target in ("askill", "avault", "git-runtime", "tmux"):
+        args = parser.parse_args(["doctor", "repair", target, "--yes"])
+        assert args.doctor_repair_targets == [target]
+    assert args.yes is True
 
 
 def test_doctor_parser_accepts_fast_and_deep_modes():

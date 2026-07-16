@@ -5,6 +5,7 @@ import json
 import stat
 import io
 import tarfile
+import urllib.error
 from pathlib import Path
 
 import pytest
@@ -82,6 +83,30 @@ def test_download_verify_install_and_idempotent_reinstall(tmp_path: Path) -> Non
     assert Path(second["path"]) == installed_path
 
 
+def test_archive_download_retries_transient_network_failure(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    archive = _write_tmux_archive(tmp_path)
+    manifest = _write_manifest(tmp_path, archive)
+    payload = json.loads(manifest.read_text(encoding="utf-8"))
+    payload["archives"][tmux_runtime._runtime_platform_tag()]["url"] = "https://example.test/tmux.tar.gz"
+    manifest.write_text(json.dumps(payload), encoding="utf-8")
+    attempts = 0
+
+    def opener(_request, timeout):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise urllib.error.URLError(ConnectionResetError("reset"))
+        return io.BytesIO(archive.read_bytes())
+
+    monkeypatch.setattr(tmux_runtime.urllib.request, "urlopen", opener)
+    monkeypatch.setattr("core.dependency_network.time.sleep", lambda _delay: None)
+
+    result = TmuxRuntimeManager(runtime_dir=tmp_path / "runtime", manifest_path=manifest).ensure()
+
+    assert result["ok"] is True
+    assert attempts == 2
+
+
 def test_bad_checksum_is_rejected(tmp_path: Path) -> None:
     archive = _write_tmux_archive(tmp_path)
     manifest = _write_manifest(tmp_path, archive, sha256="0" * 64)
@@ -92,6 +117,47 @@ def test_bad_checksum_is_rejected(tmp_path: Path) -> None:
     assert result["ok"] is False
     assert result["reason"] == "tmux_archive_checksum_mismatch"
     assert manager.resolve_binary() is None
+
+
+def test_successful_archive_fetch_clears_stale_download_error_before_checksum_failure(tmp_path: Path) -> None:
+    archive = _write_tmux_archive(tmp_path)
+    manifest = _write_manifest(tmp_path, archive, sha256="0" * 64)
+    manager = TmuxRuntimeManager(runtime_dir=tmp_path / "runtime", manifest_path=manifest)
+    manager._download_error = {"kind": "timeout", "message": "old timeout"}
+
+    result = manager.ensure()
+
+    assert result["reason"] == "tmux_archive_checksum_mismatch"
+    assert "checksum" in result["message"]
+    assert "old timeout" not in result["message"]
+    assert result["download_error"] is None
+
+
+def test_archive_probe_rejects_unsupported_scheme_before_network(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    archive = _write_tmux_archive(tmp_path)
+    manifest = _write_manifest(tmp_path, archive)
+    payload = json.loads(manifest.read_text(encoding="utf-8"))
+    payload["archives"][tmux_runtime._runtime_platform_tag()]["url"] = (
+        "http://user:secret@example.test/tmux.tar.gz?token=secret"
+    )
+    manifest.write_text(json.dumps(payload), encoding="utf-8")
+    monkeypatch.setattr(
+        tmux_runtime,
+        "probe_url",
+        lambda *_args, **_kwargs: pytest.fail("unsupported URL must not be probed"),
+    )
+
+    result = TmuxRuntimeManager(runtime_dir=tmp_path / "runtime", manifest_path=manifest).probe_archive_reachability()
+
+    assert result == {
+        "ok": False,
+        "checked": False,
+        "reason": "tmux_archive_url_unsupported",
+        "url": "http://example.test/tmux.tar.gz",
+    }
 
 
 def test_install_rejects_non_runnable_binary(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

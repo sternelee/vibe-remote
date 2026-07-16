@@ -11,7 +11,10 @@ from __future__ import annotations
 import hashlib
 import io
 import json
+import os
+import subprocess
 import tarfile
+import urllib.error
 from unittest.mock import Mock
 
 import pytest
@@ -111,7 +114,58 @@ def test_install_askill_uses_official_curl_installer(monkeypatch):
     assert out["ok"]
     assert captured["name"] == "askill"
     assert captured["cmd"][:2] == ["bash", "-c"]
-    assert "curl -fsSL https://askill.sh | sh" in captured["cmd"][2]
+    assert "https://askill.sh | sh" in captured["cmd"][2]
+    assert "--retry 2" in captured["cmd"][2]
+    assert "--retry-all-errors" not in captured["cmd"][2]
+
+
+def test_curl_installer_command_uses_pipe_safe_retry_flags(tmp_path):
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    curl_log = tmp_path / "curl.log"
+    curl = bin_dir / "curl"
+    curl.write_text(
+        "#!/usr/bin/env bash\n"
+        f"printf '%s\\n' \"$*\" >> {curl_log!s}\n"
+        "printf '#!/bin/sh\\nexit 0\\n'\n",
+        encoding="utf-8",
+    )
+    curl.chmod(0o755)
+    env = os.environ.copy()
+    env["PATH"] = os.pathsep.join([str(bin_dir), "/usr/bin", "/bin"])
+
+    result = subprocess.run(
+        api._curl_installer_command("https://example.test/install.sh", "sh"),
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+
+    assert result.returncode == 0, result.stderr
+    calls = curl_log.read_text(encoding="utf-8").splitlines()
+    assert len(calls) == 1
+    assert "--retry 2" in calls[0]
+    assert "--retry-all-errors" not in calls[0]
+
+
+def test_avault_download_retries_transient_network_failure(monkeypatch):
+    attempts = 0
+
+    def opener(_request, timeout):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise urllib.error.URLError(ConnectionResetError("reset"))
+        return _FakeHTTPResponse(b"manifest")
+
+    monkeypatch.setattr(api.urllib.request, "urlopen", opener)
+    monkeypatch.setattr("core.dependency_network.time.sleep", lambda _delay: None)
+
+    result = api._download_avault_release_file("https://example.test/manifest.json")
+
+    assert result == b"manifest"
+    assert attempts == 2
 
 
 def test_askill_install_command_does_not_persist_agent_cli_path(monkeypatch):
@@ -143,6 +197,17 @@ def test_install_askill_unsupported_without_curl(monkeypatch):
     monkeypatch.setattr(api, "resolve_cli_path", lambda b: None)
     monkeypatch.setattr(api, "_run_install_command", lambda *a, **k: pytest.fail("should not install"))
     out = api.install_askill()
+    assert out["ok"] is False
+    assert "askill.sh" in out["message"]
+
+
+def test_install_askill_unsupported_on_windows_even_with_tools(monkeypatch):
+    monkeypatch.setattr("platform.system", lambda: "Windows")
+    monkeypatch.setattr(api, "resolve_cli_path", lambda binary: f"C:/{binary}.exe")
+    monkeypatch.setattr(api, "_run_install_command", lambda *a, **k: pytest.fail("should not install"))
+
+    out = api.install_askill()
+
     assert out["ok"] is False
     assert "askill.sh" in out["message"]
 
@@ -932,6 +997,33 @@ def test_startup_show_page_prewarm_limit_env(monkeypatch):
 
 def test_start_dependency_install_job_rejects_unknown():
     assert api.start_dependency_install_job("bogus")["ok"] is False
+
+
+def test_prepare_show_runtime_job_surfaces_retry_diagnostics(monkeypatch):
+    import core.show_runtime as show_runtime
+
+    manager = Mock()
+    manager.prepare.return_value = {
+        "ok": False,
+        "reason": "runtime_archive_download_failed",
+        "status": {
+            "download_error": {
+                "kind": "timeout",
+                "message": "Connection timed out",
+                "url": "https://example.test/runtime.tgz",
+                "retryable": True,
+                "attempts": 3,
+            }
+        },
+    }
+    monkeypatch.setattr(show_runtime, "get_show_runtime_manager", lambda: manager)
+
+    result = api._prepare_show_runtime_job()
+
+    assert result["ok"] is False
+    assert result["reason"] == "runtime_archive_download_failed"
+    assert result["download_error"]["attempts"] == 3
+    assert "after 3 attempts" in result["message"]
 
 
 def test_start_dependency_install_job_runs_askill(monkeypatch):

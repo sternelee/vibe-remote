@@ -25,6 +25,7 @@ from typing import Any
 import httpx
 
 from config import paths
+from core.dependency_network import dependency_error_details, fetch_bytes, fetch_to_path, probe_url, redact_url
 from core.show_pages import SHOW_RUNTIME_RECOVERY_LOADING_DELAY_SECONDS
 from core.process_isolation import KILL_SIGNAL, isolated_subprocess_kwargs, signal_process_tree
 
@@ -132,6 +133,7 @@ class ShowRuntimeManager:
         self.cache_root = self.runtime_dir / "vite-cache"
         self._install_attempted = False
         self._install_reason: str | None = None
+        self._download_error: dict[str, Any] | None = None
         self._managed_command: list[str] | None = None
         self._process: subprocess.Popen[str] | None = None
         self._base_url: str | None = None
@@ -388,6 +390,7 @@ class ShowRuntimeManager:
             self._install_reason = "runtime_source_unsupported"
             return None
         if command:
+            self._download_error = None
             self._clean_after_managed_install(command)
         return command
 
@@ -421,6 +424,7 @@ class ShowRuntimeManager:
         installed_command: list[str] | None = configured_command
         installed_dir: Path | None = None
         archive: ShowRuntimeArchive | None = None
+        archive_status: dict[str, Any] | None = None
         installed_matches = False
         if not configured_command and manifest:
             archive = manifest.archives.get(platform_tag)
@@ -432,6 +436,14 @@ class ShowRuntimeManager:
         elif not configured_command and self.runtime_source == _RUNTIME_SOURCE_ARCHIVE:
             installed_dir = self._archive_install_dir()
             installed_command = self._archive_runtime_command(installed_dir, node or ["node"])
+            archive_status = {
+                "platform": platform_tag,
+                "name": _runtime_archive_name(),
+                "url": _redact_download_url(self.archive_url) if not self.archive_path else None,
+                "path": str(self.archive_path) if self.archive_path else None,
+                "sha256": None,
+                "size": None,
+            }
         elif not configured_command and self.runtime_source == _RUNTIME_SOURCE_GITHUB:
             installed_dir = self._github_source_dir()
             installed_command = self._github_runtime_command(installed_dir, node or ["node"])
@@ -446,13 +458,82 @@ class ShowRuntimeManager:
             "node_version": _format_semver(node_version),
             "node_supported": node_supported,
             "manifest": _manifest_status_payload(manifest),
-            "archive": _archive_status_payload(archive),
+            "archive": archive_status or _archive_status_payload(archive),
             "installed": installed_command is not None,
             "installed_matches_manifest": installed_matches,
             "install_dir": str(installed_dir) if installed_dir else None,
             "command": installed_command,
             "reason": self._install_reason,
+            "download_error": self._download_error,
         }
+
+    def probe_archive_reachability(self, *, timeout: float = 10.0) -> dict[str, Any]:
+        """Check the selected archive without downloading its body or mutating the cache."""
+        archive_url: str | None = None
+        if self.runtime_source == _RUNTIME_SOURCE_MANIFEST:
+            manifest = self._load_runtime_manifest()
+            if not manifest:
+                return {
+                    "ok": False,
+                    "checked": False,
+                    "reason": self._install_reason or "runtime_manifest_missing",
+                    "download_error": self._download_error,
+                }
+            archive = self._manifest_archive_for_platform(manifest)
+            if not archive:
+                return {
+                    "ok": False,
+                    "checked": False,
+                    "reason": self._install_reason or "runtime_platform_unsupported",
+                }
+            archive_url = archive.url
+        elif self.runtime_source == _RUNTIME_SOURCE_ARCHIVE:
+            if self.archive_path:
+                return {
+                    "ok": self.archive_path.is_file(),
+                    "checked": True,
+                    "kind": "local_file",
+                    "path": str(self.archive_path),
+                    "reason": None if self.archive_path.is_file() else "runtime_archive_missing",
+                }
+            archive_url = self.archive_url
+        else:
+            return {
+                "ok": False,
+                "checked": False,
+                "reason": "runtime_archive_probe_not_applicable",
+                "provider": self.runtime_source,
+            }
+
+        parsed = urllib.parse.urlparse(archive_url)
+        if parsed.scheme == "file":
+            path = Path(urllib.request.url2pathname(parsed.path))
+            return {
+                "ok": path.is_file(),
+                "checked": True,
+                "kind": "local_file",
+                "url": _redact_download_url(archive_url),
+                "reason": None if path.is_file() else "runtime_archive_missing",
+            }
+        if parsed.scheme != "https":
+            return {
+                "ok": False,
+                "checked": False,
+                "url": _redact_download_url(archive_url),
+                "reason": "runtime_archive_url_unsupported",
+            }
+
+        result = probe_url(
+            archive_url,
+            timeout=timeout,
+            opener=urllib.request.urlopen,
+            user_agent="avibe-show-runtime-doctor",
+        )
+        if result.get("reason") == "dependency_probe_unsupported":
+            result["reason"] = "runtime_archive_probe_unsupported"
+        elif result.get("reason") == "dependency_download_failed":
+            result["reason"] = "runtime_archive_download_failed"
+        return result
 
     def clean(self, *, keep_previous: int = 1) -> dict[str, Any]:
         removed: list[str] = []
@@ -698,12 +779,16 @@ class ShowRuntimeManager:
                 self._install_reason = "runtime_manifest_unavailable_offline"
                 return None
             try:
-                with urllib.request.urlopen(self.manifest_url, timeout=30) as response:
-                    payload = response.read()
+                payload = fetch_bytes(
+                    self.manifest_url,
+                    timeout=30,
+                    opener=urllib.request.urlopen,
+                )
                 source = self.manifest_url
-            except Exception:
+            except Exception as exc:
                 logger.exception("Failed to download Show Runtime manifest from %s", self.manifest_url)
                 self._install_reason = "runtime_manifest_download_failed"
+                self._download_error = _runtime_download_error(exc, self.manifest_url)
                 return None
         else:
             try:
@@ -765,6 +850,7 @@ class ShowRuntimeManager:
     def _resolve_manifest_archive(self, archive: ShowRuntimeArchive) -> Path | None:
         cached = self.runtime_dir / "downloads" / f"{archive.sha256}.tgz"
         if cached.exists() and self._downloaded_archive_matches(cached, archive):
+            self._download_error = None
             return cached
         if self.offline:
             self._install_reason = "runtime_archive_unavailable_offline"
@@ -776,17 +862,23 @@ class ShowRuntimeManager:
         tmp_path = cached.with_suffix(".tmp")
         cached.parent.mkdir(parents=True, exist_ok=True)
         try:
-            with urllib.request.urlopen(archive.url, timeout=60) as response, tmp_path.open("wb") as destination:
-                shutil.copyfileobj(response, destination)
+            fetch_to_path(
+                archive.url,
+                tmp_path,
+                timeout=60,
+                opener=urllib.request.urlopen,
+            )
             if not self._downloaded_archive_matches(tmp_path, archive):
                 tmp_path.unlink(missing_ok=True)
                 return None
             tmp_path.replace(cached)
+            self._download_error = None
             return cached
-        except Exception:
+        except Exception as exc:
             logger.exception("Failed to download Show Runtime archive from %s", archive.url)
             tmp_path.unlink(missing_ok=True)
             self._install_reason = "runtime_archive_download_failed"
+            self._download_error = _runtime_download_error(exc, archive.url)
             return None
 
     def _downloaded_archive_matches(self, path: Path, archive: ShowRuntimeArchive) -> bool:
@@ -957,11 +1049,17 @@ class ShowRuntimeManager:
         target = self.runtime_dir / "downloads" / _runtime_archive_name()
         target.parent.mkdir(parents=True, exist_ok=True)
         try:
-            with urllib.request.urlopen(archive_url, timeout=60) as response, target.open("wb") as destination:
-                shutil.copyfileobj(response, destination)
-        except Exception:
+            fetch_to_path(
+                archive_url,
+                target,
+                timeout=60,
+                opener=urllib.request.urlopen,
+            )
+            self._download_error = None
+        except Exception as exc:
             logger.exception("Failed to download prebuilt Show Runtime from %s", archive_url)
             self._install_reason = "runtime_archive_download_failed"
+            self._download_error = _runtime_download_error(exc, archive_url)
             return None
         return target
 
@@ -1377,13 +1475,21 @@ def _manifest_status_payload(manifest: ShowRuntimeManifest | None) -> dict[str, 
     }
 
 
+def _redact_download_url(url: str) -> str:
+    return redact_url(url)
+
+
+def _runtime_download_error(exc: BaseException, url: str) -> dict[str, Any]:
+    return dependency_error_details(exc, url)
+
+
 def _archive_status_payload(archive: ShowRuntimeArchive | None) -> dict[str, Any] | None:
     if archive is None:
         return None
     return {
         "platform": archive.platform,
         "name": archive.name,
-        "url": archive.url,
+        "url": _redact_download_url(archive.url),
         "sha256": archive.sha256,
         "size": archive.size,
     }
