@@ -41,20 +41,35 @@ export const Dock: React.FC = () => {
   const pinBySession = useMemo(() => new Map(pins.map((pin) => [pin.session_id, pin])), [pins]);
   const pageBySession = useMemo(() => new Map(pages.map((page) => [page.session_id, page])), [pages]);
 
+  // A Show Page's display identity from the live inventory: title prefers the live
+  // session title, then the pin snapshot, then the session id; icon_version is the
+  // has-icon signal + cache token. Shared by the resident tiles and the minimized
+  // chips so a page reads identically wherever it appears (§7.1k item 2).
+  const showpageIdentity = useMemo(
+    () =>
+      (sessionId: string, fallbackTitle?: string): { title: string; iconVersion: string | null } => {
+        const page = pageBySession.get(sessionId);
+        // live session title → pin snapshot → caller fallback (e.g. a minimized
+        // window's own title, so it survives an unloaded/failed inventory) → sid.
+        const title = page
+          ? page.title?.trim() || t('chat.untitled')
+          : pinBySession.get(sessionId)?.title_snapshot?.trim() || fallbackTitle?.trim() || sessionId;
+        return { title, iconVersion: page?.icon_version ?? null };
+      },
+    [pageBySession, pinBySession, t],
+  );
+
   const resolveItem = useMemo(() => {
     return (id: string): ResidentItem | null => {
       const sessionId = dockIdToSession(id);
       if (sessionId !== null) {
-        const page = pageBySession.get(sessionId);
-        const title = page
-          ? page.title?.trim() || t('chat.untitled')
-          : pinBySession.get(sessionId)?.title_snapshot?.trim() || sessionId;
-        return { kind: 'showpage', id, sessionId, title, iconVersion: page?.icon_version ?? null };
+        const { title, iconVersion } = showpageIdentity(sessionId);
+        return { kind: 'showpage', id, sessionId, title, iconVersion };
       }
       const def = APP_REGISTRY[id as AppId];
       return def ? { kind: 'builtin', id, def } : null;
     };
-  }, [pageBySession, pinBySession, t]);
+  }, [showpageIdentity]);
 
   // Local, drag-mutable copy of the order; framer's Reorder updates it live, and
   // it re-syncs whenever the server order changes (load / pin / unpin elsewhere).
@@ -199,9 +214,14 @@ export const Dock: React.FC = () => {
                       setMenu({ x: e.clientX, y: e.clientY, item });
                     }}
                     className={clsx(
-                      'grid size-10 place-items-center overflow-hidden rounded-xl border text-[15px] font-bold leading-none transition',
+                      // §7.1k: 12px radius (rounded-lg = --radius-lg = 12px in this theme;
+                      // rounded-xl is 16px here) unified with the App Library / ⌘K tiles.
+                      // No shared `border` here: built-in tiles carry their own neutral
+                      // border (accent only when focused); pinned Show Page tiles are
+                      // borderless — the accent lives in the tint + letter color.
+                      'grid size-10 place-items-center overflow-hidden rounded-lg text-[15px] font-bold leading-none transition',
                       item.kind === 'builtin' &&
-                        (active ? 'border-2 bg-foreground/[0.07]' : 'border-border bg-foreground/[0.03] hover:bg-foreground/[0.07]'),
+                        (active ? 'border-2 bg-foreground/[0.07]' : 'border border-border bg-foreground/[0.03] hover:bg-foreground/[0.07]'),
                     )}
                     style={
                       item.kind === 'builtin'
@@ -209,14 +229,17 @@ export const Dock: React.FC = () => {
                           ? { borderColor: `var(${item.def.accent})` }
                           : undefined
                         : {
-                            // Pinned Show Page: a letter avatar on a hashed accent tint (no icon
-                            // pipeline). Border brightens to the full accent when focused.
+                            // Pinned Show Page: the page's favicon or a letter avatar on a
+                            // hashed accent tint (no icon pipeline). §7.1k: the per-session
+                            // accent RESTING border is gone (it read as noisy across many
+                            // pinned tiles); the accent survives as the 16% tint + letter
+                            // color. The FOCUSED tile shows an accent ring (box-shadow, not a
+                            // resting border) — visible even over an opaque favicon, where a
+                            // tint change would be hidden; only one tile is focused at a time,
+                            // so it is not the noisy multi-color resting look §7.1k removed.
                             color: `var(${avatar!.accentVar})`,
                             backgroundColor: `color-mix(in srgb, var(${avatar!.accentVar}) 16%, transparent)`,
-                            borderWidth: active ? 2 : 1,
-                            borderColor: active
-                              ? `var(${avatar!.accentVar})`
-                              : `color-mix(in srgb, var(${avatar!.accentVar}) 34%, transparent)`,
+                            boxShadow: active ? `0 0 0 2px var(${avatar!.accentVar})` : undefined,
                           }
                     }
                   >
@@ -278,7 +301,19 @@ export const Dock: React.FC = () => {
         {minimized.map((w) => {
           const def = APP_REGISTRY[w.appId];
           const Icon = def.icon;
-          const label = w.title ?? t(def.titleKey);
+          // A showpage window's chip mirrors its Dock tile: the page's OWN icon
+          // (favicon → letter avatar with its accent) and its live title. Every
+          // other app keeps its registry glyph — that IS its icon (§7.1k item 2).
+          // Resolve the sessionId param via a local first (the registry idiom) so
+          // the typeof check narrows without a possibly-undefined property access.
+          const rawSessionId = w.appId === 'showpage' ? w.params?.sessionId : undefined;
+          const sessionId = typeof rawSessionId === 'string' && rawSessionId ? rawSessionId : null;
+          // Pass w.title as the identity fallback so a persisted minimized window keeps
+          // its real title if the inventory hasn't loaded / failed (Codex P3); the
+          // live/pinned title still wins when available.
+          const identity = sessionId ? showpageIdentity(sessionId, w.title) : null;
+          const avatar = sessionId && identity ? showPageAvatar(sessionId, identity.title) : null;
+          const label = identity ? identity.title : (w.title ?? t(def.titleKey));
           return (
             <button
               key={w.id}
@@ -296,7 +331,25 @@ export const Dock: React.FC = () => {
                   <span className="size-1 rounded-full" style={{ backgroundColor: '#28c840' }} />
                 </span>
                 <span className="grid flex-1 place-items-center">
-                  <Icon className="size-4" style={{ color: `var(${def.accent})` }} />
+                  {sessionId && avatar ? (
+                    // The page's favicon (else letter avatar on its accent tint) — the
+                    // same shared chokepoint the Dock tile uses, scaled to the chip body.
+                    <span
+                      aria-hidden
+                      className="grid size-5 place-items-center overflow-hidden rounded-md text-[11px] font-bold leading-none"
+                      style={{
+                        color: `var(${avatar.accentVar})`,
+                        backgroundColor: `color-mix(in srgb, var(${avatar.accentVar}) 16%, transparent)`,
+                      }}
+                    >
+                      <ShowPageAvatarContent
+                        iconUrl={showPageIconUrl(sessionId, identity!.iconVersion)}
+                        letter={avatar.letter}
+                      />
+                    </span>
+                  ) : (
+                    <Icon className="size-4" style={{ color: `var(${def.accent})` }} />
+                  )}
                 </span>
               </span>
               <span className="max-w-full truncate text-[10px] leading-tight text-muted">{label}</span>
