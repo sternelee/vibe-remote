@@ -9,6 +9,11 @@ import type { DockDoc } from './DockContext';
 // itself lives with the DockProvider that owns reconciliation.
 export type DockResponse = { ok: boolean; dock: DockDoc };
 
+// Global workbench toggles persisted server-side in state_meta. Currently just
+// the background-work banner switch (spec req 2); read by ChatPage (to gate the
+// banner) and the Harness page (the toggle card).
+export type WorkbenchPrefs = { ok?: boolean; background_work_banner_enabled: boolean };
+
 // One backend's *global* instructions file, surfaced by the Global Prompts
 // editor. ``backend`` is an agent backend id (claude / opencode / codex).
 export type GlobalPromptFile = {
@@ -421,6 +426,10 @@ export type ApiContextType = {
    *  reorder is rejected server-side and re-synced without a toast. Returns the
    *  payload; check ``ok``. */
   setDockOrder: (order: string[], known?: string[]) => Promise<DockResponse>;
+  /** Global workbench toggles (state_meta-backed): banner on/off. */
+  getWorkbenchPrefs: () => Promise<WorkbenchPrefs>;
+  /** Persist the background-work banner global toggle; resolves to updated prefs. */
+  setBackgroundWorkBannerEnabled: (enabled: boolean) => Promise<WorkbenchPrefs>;
   getBindCodes: () => Promise<any>;
   createBindCode: (type: string, expiresAt?: string) => Promise<any>;
   deleteBindCode: (code: string) => Promise<any>;
@@ -1012,6 +1021,14 @@ export type MessageSearchResult = {
   session_count: number;
 };
 
+// Union item for the background-work banner. Backend activities (from the
+// process-local SessionActivityRegistry) and live-derived harness items
+// (watches / scheduled tasks / delegated agent runs) share this shape. The
+// legacy fields stay for backward compatibility; `item_kind` / `label` /
+// `since` are the unified fields the banner renders and routes on. `item_kind`
+// is optional so a pre-union payload degrades to a backend activity.
+export type SessionActivityItemKind = 'backend_activity' | 'watch' | 'task' | 'agent_run';
+
 export type SessionActivityState = {
   id: string;
   backend: string;
@@ -1022,6 +1039,9 @@ export type SessionActivityState = {
   description: string | null;
   started_at: string;
   updated_at: string;
+  item_kind?: SessionActivityItemKind;
+  label?: string | null;
+  since?: string;
 };
 
 export type SessionRuntimeState = {
@@ -1266,6 +1286,8 @@ export type HarnessBootstrapParams = {
   tab?: 'tasks' | 'watches' | 'runs';
   status?: HarnessDefinitionStatus | HarnessRunStatus;
   query?: string;
+  /** Scope tasks/watches to a bound session (background-work banner deep-link). */
+  session_id?: string;
   page?: number;
   limit?: number;
 };
@@ -2211,6 +2233,22 @@ export const ApiProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       );
       return payloadJson;
     },
+    getWorkbenchPrefs: () => getCachedJson('/api/workbench/prefs', 5_000),
+    setBackgroundWorkBannerEnabled: async (enabled) => {
+      // Default handleError:true — a non-2xx (auth/CSRF/server) throws so the
+      // caller reverts its optimistic switch instead of diverging from the
+      // persisted value.
+      const { payloadJson } = await requestJson(
+        '/api/workbench/prefs',
+        {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ background_work_banner_enabled: enabled }),
+        },
+        'PUT /api/workbench/prefs',
+      );
+      return payloadJson;
+    },
     getBindCodes: () => getJson('/api/bind-codes'),
     createBindCode: (type, expiresAt) => postJson('/api/bind-codes', { type, expires_at: expiresAt }),
     deleteBindCode: (code) => deleteJson(`/api/bind-codes/${encodeURIComponent(code)}`),
@@ -2611,6 +2649,7 @@ export const ApiProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       if (params?.tab) search.set('tab', params.tab);
       if (params?.status) search.set('status', params.status);
       if (params?.query) search.set('query', params.query);
+      if (params?.session_id) search.set('session_id', params.session_id);
       if (params?.page) search.set('page', String(params.page));
       if (params?.limit) search.set('limit', String(params.limit));
       const qs = search.toString();

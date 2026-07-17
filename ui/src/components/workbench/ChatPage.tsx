@@ -1,21 +1,23 @@
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { Link, useLocation, useNavigate, useParams, useSearchParams } from 'react-router-dom';
-import { Activity, ArrowLeft, Bell, Bot, ChevronDown, Clock, GitFork, Info, Loader2, MessageSquare, Pencil, Presentation, Undo2, UploadCloud, X } from 'lucide-react';
+import { Activity, ArrowLeft, ArrowRight, Bell, Bot, ChevronDown, ChevronRight, Clock, Eye, GitFork, Info, Loader2, MessageSquare, Pencil, Presentation, Terminal, Undo2, UploadCloud, X } from 'lucide-react';
+import type { LucideIcon } from 'lucide-react';
 import clsx from 'clsx';
 
 import { useApi } from '../../context/ApiContext';
 import { useToast } from '../../context/ToastContext';
 import { useWorkbenchInbox } from '../../context/WorkbenchInboxContext';
 import { useRegisterComposerTarget, type ComposerInsertTarget } from '../../context/ComposerBridgeContext';
-import type { SessionRuntimeState, VaultRequest, VibeAgentBrief, WorkbenchMessage, WorkbenchSession } from '../../context/ApiContext';
+import type { SessionActivityItemKind, SessionActivityState, SessionRuntimeState, VaultRequest, VibeAgentBrief, WorkbenchMessage, WorkbenchSession } from '../../context/ApiContext';
 import { apiFetch } from '../../lib/apiFetch';
 import { normalizeChatMessageFontSize } from '../../lib/chatDisplay';
 import { isNotifyMessageType, isTerminalAgentMessage } from '../../lib/chatMessageTypes';
 import { useIosKeyboardInset } from '../../lib/useIosKeyboardInset';
 import { isProxyMediaUrl } from '../../lib/mediaProxy';
 import { localPath, type ShowPageLinkInfo } from '../../lib/showPageLinks';
-import { formatLocalDateTime } from '../../lib/relativeTime';
+import { formatLocalDateTime, formatRelativeTime } from '../../lib/relativeTime';
+import { activityItemKind, harnessNavPath, resolveActivityLabel, sortBackgroundActivities } from '../../lib/backgroundActivity';
 import { useFileDrop } from '../../lib/useFileDrop';
 import { quoteText } from '../../lib/quoteText';
 import { mergeById, insertMessageOrdered } from '../../lib/transcriptOrder';
@@ -30,6 +32,7 @@ import { ImageViewerProvider } from '../ui/image-viewer';
 import { FileViewerProvider } from '../ui/file-viewer';
 import { Input } from '../ui/input';
 import { Markdown } from '../ui/markdown';
+import { Popover, PopoverContent, PopoverTrigger } from '../ui/popover';
 import { VaultApprovalFloat, VaultChatRequests } from '../ui/vault-chat-requests';
 import { StatusPill } from '../visual';
 import { usePendingVaultRequests } from '../../lib/usePendingVaultRequests';
@@ -294,6 +297,11 @@ export const ChatPage: React.FC = () => {
   // other origin we observe). Drives the thinking bubble + the Send→Stop swap.
   const [working, setWorking] = useState(false);
   const [runtimeState, setRuntimeState] = useState<SessionRuntimeState>(emptyRuntimeState);
+  // Global background-work banner toggle (spec req 2), persisted server-side.
+  // Tri-state: null = not yet known → suppress the banner so a stored "off"
+  // never flashes on first paint; resolves to the stored value (ON when absent),
+  // or ON on a fetch error so a transient failure can't hide live work.
+  const [bannerEnabled, setBannerEnabled] = useState<boolean | null>(null);
   // Bumped on resume (tab visible again / network back) to force the transcript
   // subscription effect to reopen a possibly-dead SSE stream — see the
   // visibility effect below.
@@ -372,6 +380,22 @@ export const ChatPage: React.FC = () => {
   useEffect(() => {
     hasNativeRef.current = Boolean(session?.native_session_id);
   }, [session]);
+  // Read the global banner toggle once per mount (cached GET). Absent/failed →
+  // default ON, so a transient prefs error never hides live background work.
+  useEffect(() => {
+    let cancelled = false;
+    api
+      .getWorkbenchPrefs()
+      .then((prefs) => {
+        if (!cancelled) setBannerEnabled(prefs?.background_work_banner_enabled !== false);
+      })
+      .catch(() => {
+        if (!cancelled) setBannerEnabled(true); // default ON on error
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [api]);
   const refreshSessionRowUntilNativeBound = useCallback(async () => {
     const id = sessionIdRef.current;
     if (!id || hasNativeRef.current) return;
@@ -1527,7 +1551,7 @@ export const ChatPage: React.FC = () => {
             ) : null
           }
         />
-        <ActivityStrip state={runtimeState} />
+        <ActivityStrip state={runtimeState} sessionId={sessionId ?? ''} enabled={bannerEnabled === true} />
         <QueueStrip queue={queue} onRemove={removeQueued} onRecall={recallQueued} onSendNow={sendQueueNow} />
         {sessionId && pendingApprovals.length > 0 ? (
           <VaultApprovalFloat offscreen={offscreenApprovals} pending={pendingApprovals} onResolved={refreshVaultRequests} />
@@ -1628,47 +1652,208 @@ const QueueRow: React.FC<{
   );
 };
 
-const ActivityStrip: React.FC<{ state: SessionRuntimeState }> = ({ state }) => {
+// Kind glyph + color tint per unified banner item. Backend activities and the
+// three harness sources each get a distinct icon and soft-tinted box (design:
+// mint / cyan / gold / violet, via the established bg-<color>/15 pattern).
+const ACTIVITY_ITEM_ICON: Record<SessionActivityItemKind, LucideIcon> = {
+  backend_activity: Terminal,
+  watch: Eye,
+  task: Clock,
+  agent_run: Bot,
+};
+
+const ACTIVITY_ITEM_TINT: Record<SessionActivityItemKind, string> = {
+  backend_activity: 'bg-mint/15 text-mint',
+  watch: 'bg-cyan/15 text-cyan',
+  task: 'bg-gold/15 text-gold',
+  agent_run: 'bg-violet/15 text-violet',
+};
+
+// item_kind (snake_case wire value) -> chat.activities.kind.* i18n leaf.
+const ACTIVITY_ITEM_I18N: Record<SessionActivityItemKind, string> = {
+  backend_activity: 'backendActivity',
+  watch: 'watch',
+  task: 'task',
+  agent_run: 'agentRun',
+};
+
+// One expanded popover row: colored kind icon box + two-line label / subtitle.
+// Backend activities are display-only with a colored status word (no landing
+// page); harness rows navigate to their Harness surface on click.
+const ActivityRow: React.FC<{
+  item: SessionActivityState;
+  onNavigate: (item: SessionActivityState) => void;
+}> = ({ item, onNavigate }) => {
   const { t } = useTranslation();
-  const active = state.background_activities;
+  const kind = activityItemKind(item);
+  const Icon = ACTIVITY_ITEM_ICON[kind];
+  const kindLabel = t(`chat.activities.kind.${ACTIVITY_ITEM_I18N[kind]}`);
+  const label = resolveActivityLabel(item, kindLabel);
+  const relative = formatRelativeTime(item.since ?? item.started_at, t);
+  const isHarness = kind !== 'backend_activity';
+  const subtitle =
+    kind === 'backend_activity' && item.backend ? `${item.backend} · ${relative}` : relative;
+  const body = (
+    <>
+      <span
+        className={clsx(
+          'flex size-8 shrink-0 items-center justify-center rounded-lg',
+          ACTIVITY_ITEM_TINT[kind],
+        )}
+      >
+        <Icon className="size-4" aria-hidden="true" />
+      </span>
+      <span className="flex min-w-0 flex-1 flex-col text-left">
+        <span className="truncate text-[13px] font-medium text-foreground">
+          <span className="text-muted">{kindLabel} · </span>
+          {label}
+        </span>
+        <span className="truncate text-[11px] text-muted">{subtitle}</span>
+      </span>
+      {isHarness ? (
+        <ChevronRight className="size-4 shrink-0 self-center text-muted" aria-hidden="true" />
+      ) : (
+        <span className="shrink-0 self-center text-[11px] font-medium text-mint">
+          {t('chat.activities.status.running')}
+        </span>
+      )}
+    </>
+  );
+  if (!isHarness) {
+    return <div className="flex items-center gap-2.5 rounded-lg px-2 py-1.5">{body}</div>;
+  }
+  return (
+    <button
+      type="button"
+      onClick={() => onNavigate(item)}
+      title={t('chat.activities.openHarness', { kind: kindLabel })}
+      aria-label={t('chat.activities.openHarness', { kind: kindLabel })}
+      className="flex w-full items-center gap-2.5 rounded-lg px-2 py-1.5 transition-colors hover:bg-surface-2"
+    >
+      {body}
+    </button>
+  );
+};
+
+// The unified background-work banner: always ONE pill (count = union size); a
+// click expands an UPWARD popover (req 1) of per-kind rows sorted running-first
+// (req 5), max-height ~340 with internal scroll (req 3). Hidden entirely when
+// the global toggle is off (req 2) or the union is empty (current behavior).
+const ActivityStrip: React.FC<{
+  state: SessionRuntimeState;
+  sessionId: string;
+  enabled: boolean;
+}> = ({ state, sessionId, enabled }) => {
+  const { t } = useTranslation();
+  const navigate = useNavigate();
+  const [open, setOpen] = useState(false);
+  const active = useMemo(
+    () => sortBackgroundActivities(state.background_activities),
+    [state.background_activities],
+  );
   const pendingOutputs = state.pending_activity_output_count;
+  if (!enabled) return null;
   if (active.length === 0 && pendingOutputs === 0) return null;
 
-  const firstDescription = active.find((item) => item.description)?.description;
+  const first = active[0];
+  const firstLabel = first
+    ? resolveActivityLabel(first, t(`chat.activities.kind.${ACTIVITY_ITEM_I18N[activityItemKind(first)]}`))
+    : '';
   const connectionVisible =
     active.length > 0 &&
     (state.connection === 'reconnecting' || state.connection === 'disconnected');
+  const expandable = active.length > 0;
+  const navigateTo = (path: string) => {
+    setOpen(false);
+    navigate(path);
+  };
+
+  const pill = (
+    <StatusPill
+      tone="running"
+      role="status"
+      aria-live="polite"
+      className={clsx(
+        'min-h-7 min-w-0 max-w-[420px] gap-2 px-3 py-1 text-[11px] font-normal shadow-sm shadow-mint/5',
+        expandable && 'cursor-pointer select-none',
+      )}
+      indicator={
+        active.length > 0 ? (
+          <Activity className="size-3.5 shrink-0 text-mint" aria-hidden="true" />
+        ) : (
+          <Loader2 className="size-3.5 shrink-0 animate-spin text-mint" aria-hidden="true" />
+        )
+      }
+      label={
+        <>
+          <span className="min-w-0 truncate text-muted" title={firstLabel || undefined}>
+            {active.length > 0
+              ? t('chat.activities.running', { count: active.length })
+              : t('chat.activities.delivering', { count: pendingOutputs })}
+            {firstLabel ? ` · ${firstLabel}` : ''}
+          </span>
+          {connectionVisible ? (
+            <span className="shrink-0 border-l border-border-strong pl-2 text-gold">
+              {t(`chat.activities.connection.${state.connection}`)}
+            </span>
+          ) : null}
+          {expandable ? (
+            <ChevronDown
+              className={clsx('size-3.5 shrink-0 text-muted transition-transform', open && 'rotate-180')}
+              aria-hidden="true"
+            />
+          ) : null}
+        </>
+      }
+    />
+  );
+
   return (
     <div className="shrink-0 px-4 py-2 md:px-8">
-      <div className="mx-auto flex w-full max-w-[1080px]">
-        <StatusPill
-          tone="running"
-          role="status"
-          aria-live="polite"
-          className="min-h-7 min-w-0 max-w-full gap-2 px-3 py-1 text-[11px] font-normal shadow-sm shadow-mint/5"
-          indicator={
-            active.length > 0 ? (
-              <Activity className="size-3.5 shrink-0 text-mint" aria-hidden="true" />
-            ) : (
-              <Loader2 className="size-3.5 shrink-0 animate-spin text-mint" aria-hidden="true" />
-            )
-          }
-          label={
-            <>
-              <span className="min-w-0 truncate text-muted" title={firstDescription ?? undefined}>
-                {active.length > 0
-                  ? t('chat.activities.running', { count: active.length })
-                  : t('chat.activities.delivering', { count: pendingOutputs })}
-                {firstDescription ? ` · ${firstDescription}` : ''}
-              </span>
-              {connectionVisible ? (
-                <span className="shrink-0 border-l border-border-strong pl-2 text-gold">
-                  {t(`chat.activities.connection.${state.connection}`)}
-                </span>
-              ) : null}
-            </>
-          }
-        />
+      <div className="mx-auto w-full max-w-[1080px]">
+        {expandable ? (
+          <Popover open={open} onOpenChange={setOpen}>
+            <PopoverTrigger asChild>
+              <button
+                type="button"
+                aria-label={t('chat.activities.toggle')}
+                className="block max-w-full rounded-full outline-none focus-visible:ring-2 focus-visible:ring-mint/40"
+              >
+                {pill}
+              </button>
+            </PopoverTrigger>
+            <PopoverContent
+              side="top"
+              align="start"
+              sideOffset={8}
+              // Spec req 1: anchor to the pill's top edge and never open downward
+              // (a downward flip would cover the composer). Disable Radix
+              // collision flipping so the popover stays above even when zoomed.
+              avoidCollisions={false}
+              className="flex max-h-[340px] w-[420px] max-w-[calc(100vw-2rem)] flex-col overflow-hidden rounded-lg border-border-strong p-0 shadow-lg"
+            >
+              <div className="flex max-h-[300px] flex-col gap-0.5 overflow-y-auto p-1">
+                {active.map((item) => (
+                  <ActivityRow
+                    key={item.id}
+                    item={item}
+                    onNavigate={(it) => navigateTo(harnessNavPath(it, sessionId))}
+                  />
+                ))}
+              </div>
+              <button
+                type="button"
+                onClick={() => navigateTo('/harness')}
+                className="flex shrink-0 items-center justify-center gap-1 border-t border-border/60 px-2 py-2 text-[12px] font-medium text-cyan transition-colors hover:bg-surface-2"
+              >
+                {t('chat.activities.manageInHarness')}
+                <ArrowRight className="size-3.5" aria-hidden="true" />
+              </button>
+            </PopoverContent>
+          </Popover>
+        ) : (
+          pill
+        )}
       </div>
     </div>
   );
