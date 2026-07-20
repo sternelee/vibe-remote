@@ -17,18 +17,22 @@ from storage.importer import ensure_sqlite_state, resolve_primary_platform_from_
 from storage.models import agent_sessions, show_session_events
 
 DEFAULT_MARK_SCOPE = "default"
-SUPPORTED_EVENT_TYPES = {
-    "assistant.mark.created",
-    "assistant.mark.updated",
-    "assistant.mark.resolved",
-    "assistant.page.updated",
+HUMAN_EVENT_TYPES = {
     "human.intent.submitted",
     "human.annotation.created",
     "human.annotation.updated",
     "human.annotation.resolved",
     "human.annotation.dismissed",
+}
+SUPPORTED_EVENT_TYPES = {
+    "assistant.mark.created",
+    "assistant.mark.updated",
+    "assistant.mark.resolved",
+    "assistant.page.updated",
     "system.runtime.status",
     "system.runtime.error",
+    "system.annotation.control",
+    *HUMAN_EVENT_TYPES,
 }
 ANNOTATION_EVENT_TYPES = {
     "human.annotation.created",
@@ -68,14 +72,24 @@ class ShowSessionEventStore:
     def close(self) -> None:
         self.engine.dispose()
 
-    def append(self, session_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+    def append(
+        self,
+        session_id: str,
+        payload: dict[str, Any],
+        *,
+        author: dict[str, str] | None = None,
+    ) -> dict[str, Any]:
         validate_show_event_payload_session(session_id, payload)
         event_type = _validate_event_type(payload.get("type"))
         actor = _actor_for_event(event_type)
         event_payload = _normalize_event_payload(event_type, payload)
+        if actor == "human":
+            event_payload.pop("author", None)
         anchor = _event_anchor(event_type, payload, event_payload)
         scope = _event_scope(event_type, event_payload)
         transcript_text = _format_transcript_text(event_type, event_payload, anchor)
+        if actor == "human":
+            event_payload["author"] = _normalize_human_author(author)
         event_id = _event_id(payload, event_payload)
         created_at = _utc_now_iso()
 
@@ -122,6 +136,7 @@ class ShowSessionEventStore:
                         "show_event_id": event_id,
                         "show_event_type": event_type,
                         "show_event_scope": scope,
+                        **({"author": event_payload["author"]} if actor == "human" else {}),
                     },
                     native_message_id=f"show:{event_id}",
                 )
@@ -266,6 +281,17 @@ def _normalize_event_payload(event_type: str, payload: dict[str, Any]) -> dict[s
         if event_type == "human.annotation.resolved":
             normalized["resolvedAt"] = _text_or_none(normalized.get("resolvedAt")) or _utc_now_iso()
         return normalized
+    if event_type == "system.annotation.control":
+        control = _normalize_json_object(payload.get("payload") or payload)
+        action = _text_or_none(control.get("action"))
+        mode = _text_or_none(control.get("mode"))
+        if action not in {"enable", "disable", "set-mode"}:
+            raise ShowSessionEventError("annotation control action is invalid.", code="invalid_payload")
+        if mode is not None and mode not in {"smart", "screenshot"}:
+            raise ShowSessionEventError("annotation control mode is invalid.", code="invalid_payload")
+        if action == "set-mode" and mode is None:
+            raise ShowSessionEventError("annotation control mode is required.", code="invalid_payload")
+        return {"action": action, **({"mode": mode} if mode is not None else {})}
     normalized = _normalize_json_object(payload.get("payload") or payload)
     if not normalized:
         normalized = {}
@@ -277,6 +303,15 @@ def _normalize_event_payload(event_type: str, payload: dict[str, Any]) -> dict[s
 
 def _normalize_json_object(raw: Any) -> dict[str, Any]:
     return raw if isinstance(raw, dict) else {}
+
+
+def _normalize_human_author(author: dict[str, str] | None) -> dict[str, str]:
+    if not isinstance(author, dict) or author.get("kind") != "user":
+        return {"kind": "local"}
+    email = _text_or_none(author.get("email"))
+    if not email:
+        return {"kind": "local"}
+    return {"kind": "user", "email": email}
 
 
 def _json_object_list(raw: Any) -> list[dict[str, Any]]:
@@ -312,6 +347,8 @@ def _event_id(original_payload: dict[str, Any], event_payload: dict[str, Any]) -
 
 
 def _format_transcript_text(event_type: str, payload: dict[str, Any], anchor: dict[str, Any]) -> str:
+    if event_type == "system.annotation.control":
+        return ""
     if event_type.startswith("assistant.mark."):
         action = event_type.split(".")[-1]
         lines = [

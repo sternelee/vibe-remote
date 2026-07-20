@@ -19,6 +19,8 @@ from core.show_pages import (
     ShowPageStore,
     ensure_show_page_dir,
     show_cli_event_token,
+    show_event_write_token,
+    show_public_event_write_token,
 )
 from core.show_runtime import (
     ShowRuntimeManager,
@@ -805,12 +807,81 @@ def test_private_show_page_injects_runtime_event_config(monkeypatch, tmp_path):
     assert '"eventsPath":"/show/ses123/__show/events"' in body
     assert '"streamPath":"/show/ses123/__show/events?stream=1"' in body
     assert '"writeToken":"token-ses123"' in body
-    assert body.index("globalThis.__AVIBE_SHOW__") < body.index('type="module"')
+    assert '"annotation":{"authenticated":true,"mePath":"__show/me"}' in body
+    assert '<script type="module" src="/show/ses123/__show/annotation.js"></script>' in body
+    assert body.index("globalThis.__AVIBE_SHOW__") < body.index('/src/main.tsx')
+    assert body.index('/src/main.tsx') < body.index('/show/ses123/__show/annotation.js')
     assert "cookie" not in manager.calls[0][2]
     assert response.headers["cache-control"] == "no-store"
     assert "etag" not in response.headers
     assert "expires" not in response.headers
     assert "last-modified" not in response.headers
+
+
+@pytest.mark.parametrize("authenticated", [False, True])
+def test_public_show_page_injects_auth_aware_annotation_config(monkeypatch, tmp_path, authenticated):
+    monkeypatch.setenv("AVIBE_HOME", str(tmp_path))
+    config = _save_config(tmp_path)
+    share_id = _create_show_page("ses123", "public")
+    manager = _FakeShowRuntimeManager(
+        body=b'<!doctype html><html><head></head><body><div id="root"></div><script type="module" src="/src/main.tsx"></script></body></html>'
+    )
+    set_show_runtime_manager_for_tests(manager)
+    client = app.test_client()
+    if authenticated:
+        client.set_cookie(
+            remote_access.SESSION_COOKIE_NAME,
+            remote_access.make_session_cookie(config, "alex@example.com", "user-1"),
+            domain="alex.avibe.bot",
+        )
+    try:
+        response = client.get(
+            f"/p/{share_id}/",
+            base_url="https://alex.avibe.bot",
+            environ_base=_remote_peer(),
+        )
+    finally:
+        set_show_runtime_manager_for_tests(None)
+
+    assert response.status_code == 200
+    body = response.content.decode("utf-8")
+    base_path = f"/p/{share_id}/"
+    assert f'"sessionId":"{share_id}"' in body
+    assert '"sessionId":"ses123"' not in body
+    assert f'"basePath":"{base_path}"' in body
+    assert f'"eventsPath":"{base_path}__show/events"' in body
+    assert f'"streamPath":"{base_path}__show/events?stream=1"' in body
+    expected_auth = "true" if authenticated else "false"
+    assert f'"annotation":{{"authenticated":{expected_auth},"mePath":"__show/me"}}' in body
+    assert f'<script type="module" src="{base_path}__show/annotation.js"></script>' in body
+    assert '"writeToken"' not in body
+    assert body.index('/src/main.tsx') < body.index(f'{base_path}__show/annotation.js')
+    assert response.headers["Referrer-Policy"] == "same-origin"
+
+
+@pytest.mark.parametrize("surface", ["private", "public"])
+def test_show_annotation_bootstrap_asset_proxies_to_runtime(monkeypatch, tmp_path, surface):
+    monkeypatch.setenv("AVIBE_HOME", str(tmp_path))
+    _save_config(tmp_path)
+    if surface == "private":
+        _create_show_page("ses123", "private")
+        path = "/show/ses123/__show/annotation.js"
+    else:
+        share_id = _create_show_page("ses123", "public")
+        path = f"/p/{share_id}/__show/annotation.js"
+    manager = _FakeShowRuntimeManager(
+        body=b"export const mounted = true;",
+        extra_headers={"content-type": "text/javascript", "cache-control": "no-cache"},
+    )
+    set_show_runtime_manager_for_tests(manager)
+    try:
+        response = app.test_client().get(path, base_url="http://127.0.0.1:5123")
+    finally:
+        set_show_runtime_manager_for_tests(None)
+
+    assert response.status_code == 200
+    assert response.content == b"export const mounted = true;"
+    assert manager.calls[0][1] == "/sessions/ses123/app/__show/annotation.js"
 
 
 def test_private_show_page_does_not_inject_runtime_event_config_into_attachment_html(monkeypatch, tmp_path):
@@ -1020,7 +1091,8 @@ def test_public_show_page_does_not_inject_write_runtime_config(monkeypatch, tmp_
 
     assert response.status_code == 200
     body = response.content.decode("utf-8")
-    assert "globalThis.__AVIBE_SHOW__=Object.assign" not in body
+    assert "globalThis.__AVIBE_SHOW__=Object.assign" in body
+    assert '"writeToken"' not in body
     assert "token-ses123" not in body
 
 
@@ -1613,6 +1685,86 @@ def test_private_show_page_records_show_event(monkeypatch, tmp_path):
     assert events_response.get_json()["events"][0]["id"] == payload["event"]["id"]
 
 
+def test_private_show_me_is_always_available(monkeypatch, tmp_path):
+    monkeypatch.setenv("AVIBE_HOME", str(tmp_path))
+    _save_config(tmp_path)
+    _create_show_page("ses123", "private")
+
+    response = app.test_client().get(
+        "/show/ses123/__show/me",
+        base_url="http://127.0.0.1:5123",
+    )
+
+    assert response.status_code == 200
+    assert response.get_json() == {
+        "authenticated": True,
+        "canAnnotate": True,
+        "writeToken": show_event_write_token("ses123"),
+    }
+    assert response.headers["cache-control"] == "no-store, private"
+
+
+def test_public_show_me_is_anonymous_without_oauth_session(monkeypatch, tmp_path):
+    monkeypatch.setenv("AVIBE_HOME", str(tmp_path))
+    _save_config(tmp_path)
+    share_id = _create_show_page("ses123", "public")
+
+    response = app.test_client().get(
+        f"/p/{share_id}/__show/me",
+        base_url="https://alex.avibe.bot",
+        environ_base=_remote_peer(),
+    )
+
+    assert response.status_code == 200
+    assert response.get_json() == {"authenticated": False, "canAnnotate": False}
+
+
+def test_public_show_me_accepts_valid_workbench_session(monkeypatch, tmp_path):
+    monkeypatch.setenv("AVIBE_HOME", str(tmp_path))
+    config = _save_config(tmp_path)
+    share_id = _create_show_page("ses123", "public")
+    client = app.test_client()
+    client.set_cookie(
+        remote_access.SESSION_COOKIE_NAME,
+        remote_access.make_session_cookie(config, "alex@example.com", "user-1"),
+        domain="alex.avibe.bot",
+    )
+
+    response = client.get(
+        f"/p/{share_id}/__show/me",
+        base_url="https://alex.avibe.bot",
+        environ_base=_remote_peer(),
+    )
+
+    assert response.status_code == 200
+    assert response.get_json() == {
+        "authenticated": True,
+        "canAnnotate": True,
+        "writeToken": show_public_event_write_token(share_id, "ses123"),
+    }
+    assert response.get_json()["writeToken"] != show_event_write_token("ses123")
+
+
+def test_public_show_me_treats_no_oauth_local_access_as_authenticated(monkeypatch, tmp_path):
+    monkeypatch.setenv("AVIBE_HOME", str(tmp_path))
+    config = _save_config(tmp_path)
+    config.remote_access.vibe_cloud.enabled = False
+    config.save()
+    share_id = _create_show_page("ses123", "public")
+
+    response = app.test_client().get(
+        f"/p/{share_id}/__show/me",
+        base_url="http://127.0.0.1:5123",
+    )
+
+    assert response.status_code == 200
+    assert response.get_json() == {
+        "authenticated": True,
+        "canAnnotate": True,
+        "writeToken": show_public_event_write_token(share_id, "ses123"),
+    }
+
+
 def test_private_show_page_rejects_mismatched_event_session_id(monkeypatch, tmp_path):
     monkeypatch.setenv("AVIBE_HOME", str(tmp_path))
     _save_config(tmp_path)
@@ -1686,6 +1838,38 @@ def test_private_show_page_dispatches_human_show_event(monkeypatch, tmp_path):
     assert "Pick B." in dispatches[0]["text"]
     assert dispatches[0]["user_message_id"] == response.get_json()["event"]["message_id"]
     assert "show.dispatch" in [event_type for event_type, _data in published]
+
+
+def test_private_show_page_publishes_annotation_control_without_message_or_dispatch(monkeypatch, tmp_path):
+    monkeypatch.setenv("AVIBE_HOME", str(tmp_path))
+    _save_config(tmp_path)
+    _create_agent_session("ses123")
+    _create_show_page("ses123", "private")
+    token = "session-write-token"
+    monkeypatch.setattr("vibe.ui_server.show_event_write_token", lambda session_id: token)
+    published = []
+    monkeypatch.setattr("vibe.sse_broker.broker.publish", lambda event_type, data: published.append((event_type, data)))
+
+    response = app.test_client().post(
+        "/show/ses123/__show/events",
+        base_url="http://127.0.0.1:5123",
+        headers={
+            "Origin": "http://127.0.0.1:5123",
+            "Content-Type": "application/json",
+            "X-Vibe-Show-Token": token,
+        },
+        json={
+            "type": "system.annotation.control",
+            "payload": {"action": "enable", "mode": "smart", "dispatch": True},
+        },
+    )
+
+    assert response.status_code == 201
+    event = response.get_json()["event"]
+    assert event["payload"] == {"action": "enable", "mode": "smart"}
+    assert event["message_id"] is None
+    assert event["transcript_text"] == ""
+    assert [event_type for event_type, _data in published] == ["show.event", "session.activity"]
 
 
 def test_private_show_page_dispatches_screenshot_annotation_batch(monkeypatch, tmp_path):
@@ -1803,6 +1987,42 @@ def test_private_show_page_rejects_other_session_write_token(monkeypatch, tmp_pa
 
     assert response.status_code == 403
     assert response.get_json()["code"] == "show_event_write_forbidden"
+
+
+def test_private_show_page_records_remote_oauth_author(monkeypatch, tmp_path):
+    monkeypatch.setenv("AVIBE_HOME", str(tmp_path))
+    config = _save_config(tmp_path)
+    _create_agent_session("ses123")
+    _create_show_page("ses123", "private")
+    token = "session-write-token"
+    monkeypatch.setattr("vibe.ui_server.show_event_write_token", lambda session_id: token)
+    client = app.test_client()
+    client.set_cookie(
+        remote_access.SESSION_COOKIE_NAME,
+        remote_access.make_session_cookie(config, "alex@example.com", "user-1"),
+        domain="alex.avibe.bot",
+    )
+
+    response = client.post(
+        "/show/ses123/__show/events",
+        base_url="https://alex.avibe.bot",
+        environ_base=_remote_peer(),
+        headers={
+            "Origin": "https://alex.avibe.bot",
+            "Content-Type": "application/json",
+            "X-Vibe-Show-Token": token,
+        },
+        json={
+            "type": "human.annotation.created",
+            "annotation": {"comment": "Remote review."},
+        },
+    )
+
+    assert response.status_code == 201
+    event = response.get_json()["event"]
+    expected_author = {"kind": "user", "email": "alex@example.com"}
+    assert event["payload"]["author"] == expected_author
+    assert event["message"]["metadata"]["author"] == expected_author
 
 
 def test_private_show_page_sets_show_event_write_cookie(monkeypatch, tmp_path):
@@ -2198,7 +2418,23 @@ def test_cli_show_event_ingress_rejects_configured_host_without_cli_token(monkey
     assert response.status_code == 403
 
 
-def test_public_show_page_events_are_read_only(monkeypatch, tmp_path):
+def _public_show_write_headers(
+    share_id: str,
+    *,
+    origin: str = "https://alex.avibe.bot",
+    token_share_id: str | None = None,
+    token_session_id: str = "ses123",
+    referer_share_id: str | None = None,
+) -> dict[str, str]:
+    return {
+        "Origin": origin,
+        "Referer": f"{origin}/p/{referer_share_id or share_id}/",
+        "Content-Type": "application/json",
+        "X-Vibe-Show-Token": show_public_event_write_token(token_share_id or share_id, token_session_id),
+    }
+
+
+def test_public_show_page_events_require_login(monkeypatch, tmp_path):
     monkeypatch.setenv("AVIBE_HOME", str(tmp_path))
     _save_config(tmp_path)
     _create_agent_session("ses123")
@@ -2206,19 +2442,333 @@ def test_public_show_page_events_are_read_only(monkeypatch, tmp_path):
 
     response = app.test_client().post(
         f"/p/{share_id}/__show/events",
-        base_url="http://127.0.0.1:5123",
+        base_url="https://alex.avibe.bot",
+        environ_base=_remote_peer(),
         headers={
-            "Origin": "http://127.0.0.1:5123",
+            "Origin": "https://alex.avibe.bot",
             "Content-Type": "application/json",
         },
         json={
-            "type": "assistant.mark.created",
-            "mark": {"target": "summary", "body": "body"},
+            "type": "human.annotation.created",
+            "annotation": {"comment": "Anonymous review."},
         },
     )
 
     assert response.status_code == 403
-    assert response.get_json()["code"] == "public_show_events_read_only"
+    assert response.get_json()["code"] == "public_show_events_login_required"
+
+
+def test_public_show_page_events_require_share_token(monkeypatch, tmp_path):
+    monkeypatch.setenv("AVIBE_HOME", str(tmp_path))
+    config = _save_config(tmp_path)
+    _create_agent_session("ses123")
+    share_id = _create_show_page("ses123", "public")
+    client = app.test_client()
+    client.set_cookie(
+        remote_access.SESSION_COOKIE_NAME,
+        remote_access.make_session_cookie(config, "alex@example.com", "user-1"),
+        domain="alex.avibe.bot",
+    )
+
+    response = client.post(
+        f"/p/{share_id}/__show/events",
+        base_url="https://alex.avibe.bot",
+        environ_base=_remote_peer(),
+        headers={
+            "Origin": "https://alex.avibe.bot",
+            "Referer": f"https://alex.avibe.bot/p/{share_id}/",
+            "Content-Type": "application/json",
+        },
+        json={
+            "type": "human.annotation.created",
+            "annotation": {"comment": "Missing share token."},
+        },
+    )
+
+    assert response.status_code == 403
+    assert response.get_json()["code"] == "show_event_write_forbidden"
+
+
+@pytest.mark.parametrize(
+    "referer",
+    [None, "https://alex.avibe.bot/p/other-share/"],
+)
+def test_public_show_page_events_require_matching_share_referer(monkeypatch, tmp_path, referer):
+    monkeypatch.setenv("AVIBE_HOME", str(tmp_path))
+    config = _save_config(tmp_path)
+    _create_agent_session("ses123")
+    share_id = _create_show_page("ses123", "public")
+    client = app.test_client()
+    client.set_cookie(
+        remote_access.SESSION_COOKIE_NAME,
+        remote_access.make_session_cookie(config, "alex@example.com", "user-1"),
+        domain="alex.avibe.bot",
+    )
+    headers = _public_show_write_headers(share_id)
+    if referer is None:
+        headers.pop("Referer")
+    else:
+        headers["Referer"] = referer
+
+    response = client.post(
+        f"/p/{share_id}/__show/events",
+        base_url="https://alex.avibe.bot",
+        environ_base=_remote_peer(),
+        headers=headers,
+        json={"type": "human.annotation.created", "annotation": {"comment": "Wrong page."}},
+    )
+
+    assert response.status_code == 403
+    assert response.get_json()["code"] == "public_show_events_origin_mismatch"
+
+
+def test_public_show_page_events_reject_cross_share_token(monkeypatch, tmp_path):
+    monkeypatch.setenv("AVIBE_HOME", str(tmp_path))
+    config = _save_config(tmp_path)
+    _create_agent_session("ses123")
+    share_id = _create_show_page("ses123", "public")
+    client = app.test_client()
+    client.set_cookie(
+        remote_access.SESSION_COOKIE_NAME,
+        remote_access.make_session_cookie(config, "alex@example.com", "user-1"),
+        domain="alex.avibe.bot",
+    )
+
+    response = client.post(
+        f"/p/{share_id}/__show/events",
+        base_url="https://alex.avibe.bot",
+        environ_base=_remote_peer(),
+        headers=_public_show_write_headers(share_id, token_share_id="other-share"),
+        json={"type": "human.annotation.created", "annotation": {"comment": "Wrong token."}},
+    )
+
+    assert response.status_code == 403
+    assert response.get_json()["code"] == "show_event_write_forbidden"
+
+
+def test_public_show_page_events_reject_token_from_previous_share_owner(monkeypatch, tmp_path):
+    monkeypatch.setenv("AVIBE_HOME", str(tmp_path))
+    config = _save_config(tmp_path)
+    _create_agent_session("ses123")
+    share_id = _create_show_page("ses123", "public")
+    client = app.test_client()
+    client.set_cookie(
+        remote_access.SESSION_COOKIE_NAME,
+        remote_access.make_session_cookie(config, "alex@example.com", "user-1"),
+        domain="alex.avibe.bot",
+    )
+
+    response = client.post(
+        f"/p/{share_id}/__show/events",
+        base_url="https://alex.avibe.bot",
+        environ_base=_remote_peer(),
+        headers=_public_show_write_headers(share_id, token_session_id="ses-previous"),
+        json={"type": "human.annotation.created", "annotation": {"comment": "Stale token."}},
+    )
+
+    assert response.status_code == 403
+    assert response.get_json()["code"] == "show_event_write_forbidden"
+
+
+def test_public_show_page_events_accept_oauth_user_and_record_author(monkeypatch, tmp_path):
+    monkeypatch.setenv("AVIBE_HOME", str(tmp_path))
+    config = _save_config(tmp_path)
+    _create_agent_session("ses123")
+    share_id = _create_show_page("ses123", "public")
+    published = []
+    monkeypatch.setattr("vibe.ui_server._publish_show_session_event", published.append)
+    client = app.test_client()
+    client.set_cookie(
+        remote_access.SESSION_COOKIE_NAME,
+        remote_access.make_session_cookie(config, "member@example.com", "user-2"),
+        domain="alex.avibe.bot",
+    )
+
+    response = client.post(
+        f"/p/{share_id}/__show/events",
+        base_url="https://alex.avibe.bot",
+        environ_base=_remote_peer(),
+        headers=_public_show_write_headers(share_id),
+        json={
+            "type": "human.annotation.created",
+            "annotation": {
+                "comment": "Authenticated review.",
+                "author": {"kind": "local"},
+            },
+        },
+    )
+
+    assert response.status_code == 201
+    event = response.get_json()["event"]
+    expected_author = {"kind": "user", "email": "member@example.com"}
+    assert event["payload"]["author"] == {"kind": "user"}
+    assert "session_id" not in event
+    assert "scope_id" not in event
+    assert "message_id" not in event
+    assert "message" not in event
+
+    assert published[0]["message"]["metadata"]["author"] == expected_author
+
+    listed = client.get(
+        f"/p/{share_id}/__show/events",
+        base_url="https://alex.avibe.bot",
+        environ_base=_remote_peer(),
+    ).get_json()["events"][0]
+    assert listed["payload"]["author"] == {"kind": "user"}
+    assert "member@example.com" not in json.dumps(listed)
+
+
+def test_public_show_page_events_accept_injected_share_session_id(monkeypatch, tmp_path):
+    monkeypatch.setenv("AVIBE_HOME", str(tmp_path))
+    config = _save_config(tmp_path)
+    _create_agent_session("ses123")
+    share_id = _create_show_page("ses123", "public")
+    published = []
+    monkeypatch.setattr("vibe.ui_server._publish_show_session_event", published.append)
+    client = app.test_client()
+    client.set_cookie(
+        remote_access.SESSION_COOKIE_NAME,
+        remote_access.make_session_cookie(config, "member@example.com", "user-2"),
+        domain="alex.avibe.bot",
+    )
+
+    response = client.post(
+        f"/p/{share_id}/__show/events",
+        base_url="https://alex.avibe.bot",
+        environ_base=_remote_peer(),
+        headers=_public_show_write_headers(share_id),
+        json={
+            "sessionId": share_id,
+            "type": "human.annotation.created",
+            "annotation": {"session_id": share_id, "comment": "Authenticated review."},
+        },
+    )
+
+    assert response.status_code == 201
+    assert "sessionId" not in published[0]["payload"]
+    assert "session_id" not in published[0]["payload"]
+
+
+def test_public_show_page_intent_fallback_does_not_expose_author_email(monkeypatch, tmp_path):
+    monkeypatch.setenv("AVIBE_HOME", str(tmp_path))
+    config = _save_config(tmp_path)
+    _create_agent_session("ses123")
+    share_id = _create_show_page("ses123", "public")
+    client = app.test_client()
+    client.set_cookie(
+        remote_access.SESSION_COOKIE_NAME,
+        remote_access.make_session_cookie(config, "member@example.com", "user-2"),
+        domain="alex.avibe.bot",
+    )
+
+    response = client.post(
+        f"/p/{share_id}/__show/events",
+        base_url="https://alex.avibe.bot",
+        environ_base=_remote_peer(),
+        headers=_public_show_write_headers(share_id),
+        json={"type": "human.intent.submitted", "payload": {"intent": "choose"}},
+    )
+
+    assert response.status_code == 201
+    assert "member@example.com" not in response.content.decode("utf-8")
+    listed = client.get(
+        f"/p/{share_id}/__show/events",
+        base_url="https://alex.avibe.bot",
+        environ_base=_remote_peer(),
+    )
+    assert "member@example.com" not in listed.content.decode("utf-8")
+
+
+def test_public_show_page_events_ignore_client_event_id_and_dispatch(monkeypatch, tmp_path):
+    monkeypatch.setenv("AVIBE_HOME", str(tmp_path))
+    config = _save_config(tmp_path)
+    _create_agent_session("ses123")
+    share_id = _create_show_page("ses123", "public")
+    published = []
+    dispatch_calls = []
+    monkeypatch.setattr("vibe.ui_server._publish_show_session_event", published.append)
+    monkeypatch.setattr("vibe.ui_server._dispatch_show_event_if_requested", dispatch_calls.append)
+    client = app.test_client()
+    client.set_cookie(
+        remote_access.SESSION_COOKIE_NAME,
+        remote_access.make_session_cookie(config, "member@example.com", "user-2"),
+        domain="alex.avibe.bot",
+    )
+
+    response = client.post(
+        f"/p/{share_id}/__show/events",
+        base_url="https://alex.avibe.bot",
+        environ_base=_remote_peer(),
+        headers=_public_show_write_headers(share_id),
+        json={
+            "id": "forged\nid: injected",
+            "type": "human.annotation.created",
+            "annotation": {"comment": "Review this.", "dispatch": True},
+        },
+    )
+
+    assert response.status_code == 201
+    event = response.get_json()["event"]
+    assert event["id"] != "forged\nid: injected"
+    assert "\n" not in event["id"]
+    assert "dispatch" not in event["payload"]
+    assert "dispatch" not in published[0]["payload"]
+    assert dispatch_calls == []
+
+
+@pytest.mark.parametrize("event_type", ["assistant.mark.created", "system.annotation.control"])
+def test_public_show_page_events_reject_non_human_types(monkeypatch, tmp_path, event_type):
+    monkeypatch.setenv("AVIBE_HOME", str(tmp_path))
+    config = _save_config(tmp_path)
+    _create_agent_session("ses123")
+    share_id = _create_show_page("ses123", "public")
+    client = app.test_client()
+    client.set_cookie(
+        remote_access.SESSION_COOKIE_NAME,
+        remote_access.make_session_cookie(config, "member@example.com", "user-2"),
+        domain="alex.avibe.bot",
+    )
+
+    response = client.post(
+        f"/p/{share_id}/__show/events",
+        base_url="https://alex.avibe.bot",
+        environ_base=_remote_peer(),
+        headers=_public_show_write_headers(share_id),
+        json={"type": event_type, "payload": {"action": "enable"}},
+    )
+
+    assert response.status_code == 400
+    assert response.get_json()["code"] == "unsupported_event_type"
+
+
+def test_public_show_page_events_accept_no_oauth_local_access(monkeypatch, tmp_path):
+    monkeypatch.setenv("AVIBE_HOME", str(tmp_path))
+    config = _save_config(tmp_path)
+    config.remote_access.vibe_cloud.enabled = False
+    config.save()
+    _create_agent_session("ses123")
+    share_id = _create_show_page("ses123", "public")
+    published = []
+    monkeypatch.setattr("vibe.ui_server._publish_show_session_event", published.append)
+
+    response = app.test_client().post(
+        f"/p/{share_id}/__show/events",
+        base_url="http://127.0.0.1:5123",
+        headers=_public_show_write_headers(share_id, origin="http://127.0.0.1:5123"),
+        json={
+            "type": "human.annotation.created",
+            "annotation": {"comment": "Local review."},
+        },
+    )
+
+    assert response.status_code == 201
+    event = response.get_json()["event"]
+    assert event["payload"]["author"] == {"kind": "local"}
+    assert "session_id" not in event
+    assert "scope_id" not in event
+    assert "message_id" not in event
+    assert "message" not in event
+    assert published[0]["message"]["metadata"]["author"] == {"kind": "local"}
 
 
 def test_private_show_page_api_mutation_rejects_missing_origin(monkeypatch, tmp_path):
@@ -4352,5 +4902,6 @@ def test_public_show_page_passes_runtime_importmap_through_unmodified(monkeypatc
     # the public-surface rewriter untouched (they are not under the `/show/<id>/` base).
     assert f'<script type="importmap">{import_map}</script>' in text
     assert '<link rel="stylesheet" href="/_show-runtime/vendor/abc123/index.css">' in text
-    # Public pages never receive the private write-config injection.
-    assert "globalThis.__AVIBE_SHOW__=Object.assign" not in text
+    # Public pages receive read/auth config but never the private write token.
+    assert "globalThis.__AVIBE_SHOW__=Object.assign" in text
+    assert '"writeToken"' not in text
